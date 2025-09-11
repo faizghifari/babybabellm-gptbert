@@ -210,7 +210,7 @@ def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="ma
     else:
         seq_length = args.seq_length
         global_batch_size = args.global_batch_size
-    
+
     ratio = args.hybrid_numerator / args.hybrid_denominator if mode == "masked" else 1 - (args.hybrid_numerator / args.hybrid_denominator)
 
     # reload dataset if seq_length changed
@@ -219,12 +219,19 @@ def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="ma
             train_data = MaskedDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
         else:
             train_data = CausalDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
-        train_data.show_random_item(tokenizer)
+
+        # show lazy-loaded random item with progress bar
+        print(f"Inspecting a random {mode} item (lazy loading a shard)...")
+        for _ in tqdm(range(1), desc="Loading shard for sample"):
+            train_data.show_random_item(tokenizer)
     else:
         train_data = train_dataloader.dataset
 
     # linear batch size scaling
-    args.current_global_batch_size = int(global_batch_size / args.batch_reduction * (1 - global_step / args.max_steps) + global_batch_size * (global_step / args.max_steps) + 0.5)
+    args.current_global_batch_size = int(
+        global_batch_size / args.batch_reduction * (1 - global_step / args.max_steps)
+        + global_batch_size * (global_step / args.max_steps) + 0.5
+    )
     total_local_batch_size = int(args.current_global_batch_size * ratio + 0.5)
     if total_local_batch_size == 0:
         total_local_batch_size = 1
@@ -256,8 +263,10 @@ def init_datasets(args, tokenizer):
 
     # masked dataset
     if args.ratio != 0:
+        print("Initializing masked dataset...")
         masked_train_data = MaskedDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
-        masked_train_data.show_random_item(tokenizer)
+        for _ in tqdm(range(1), desc="Loading shard for sample (masked)"):
+            masked_train_data.show_random_item(tokenizer)
 
         total_masked_local_batch_size = int(args.current_global_batch_size * args.ratio + 0.5)
         if total_masked_local_batch_size == 0:
@@ -276,8 +285,10 @@ def init_datasets(args, tokenizer):
 
     # causal dataset
     if args.ratio != 1:
+        print("Initializing causal dataset...")
         causal_train_data = CausalDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
-        causal_train_data.show_random_item(tokenizer)
+        for _ in tqdm(range(1), desc="Loading shard for sample (causal)"):
+            causal_train_data.show_random_item(tokenizer)
 
         total_causal_local_batch_size = int(args.current_global_batch_size * (1 - args.ratio) + 0.5)
         if total_causal_local_batch_size == 0:
@@ -295,9 +306,9 @@ def init_datasets(args, tokenizer):
         )
 
     # validation dataset
+    print("Initializing validation dataset...")
     valid_dataloader = ValidationDataset(args.valid_path, tokenizer, args, rank=None, world_size=None)
     return masked_train_dataloader, causal_train_dataloader, valid_dataloader
-
 
 def training_epoch(model, ema_model, train_dataloader, valid_dataloader, optimizer, scheduler, global_step, epoch, args):
     model = model.train()
