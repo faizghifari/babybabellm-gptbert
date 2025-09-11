@@ -83,63 +83,6 @@ class Bert(nn.Module):
 
             return loss, masked_loss, causal_loss, accuracy, masked_accuracy, causal_accuracy, z_loss, num_tokens
 
-class CoherentBert(Bert):
-    def forward(self, input_ids, attention_mask, masked_lm_labels, reg_ids_1M, reg_ids_2M, reg_ids_M1, reg_ids_M2, i, j, reg_attn_mask, num_masked=None, ratio=None):
-        """Include the coherence loss in the output of Bert"""
-        coh_loss = self.coherence_loss(reg_ids_1M, reg_ids_2M, reg_ids_M1, reg_ids_M2, i, j, reg_attn_mask)
-        if num_masked is None:
-            loss, accuracy, z_loss, num_tokens = super().forward(input_ids, attention_mask, masked_lm_labels, num_masked, ratio)
-            return loss, accuracy, z_loss, num_tokens, coh_loss
-        else:
-            loss, masked_loss, causal_loss, accuracy, masked_accuracy, causal_accuracy, z_loss, num_tokens = super().forward(input_ids, attention_mask, masked_lm_labels, num_masked, ratio)
-            return loss, masked_loss, causal_loss, accuracy, masked_accuracy, causal_accuracy, z_loss, num_tokens, coh_loss
-    
-    def logit_pair(self, input_ids, attention_mask, index, o1, o2):
-        """Calculate logits for both output ids at the masked index"""
-        contextualized_embeddings = self.get_contextualized(input_ids, attention_mask)
-        n = index.numel()
-        #masked_x = torch.index_select(contextualized_embeddings.flatten(0, 1), 0, index + torch.arange(n, step=n))
-        masked_embed = contextualized_embeddings[index-1, torch.arange(n)]  # Masked predictions must be made from the previous token
-        masked_predict = self.classifier.nonlinearity(masked_embed)
-        return masked_predict[torch.arange(n), o1], masked_predict[torch.arange(n), o2]
-    
-    def coherence_loss(self, ids_1M, ids_2M, ids_M1, ids_M2, i, j, attention_mask):
-        """Calculate loss which penalises incoherence"""
-        n = i.numel()
-        i1 = ids_1M[i, torch.arange(n)]
-        i2 = ids_2M[i, torch.arange(n)]
-        j1 = ids_M1[j, torch.arange(n)]
-        j2 = ids_M2[j, torch.arange(n)]
-        pj11, pj12 = self.logit_pair(ids_1M, attention_mask, j, j1, j2)
-        pj21, pj22 = self.logit_pair(ids_2M, attention_mask, j, j1, j2)
-        pi11, pi21 = self.logit_pair(ids_M1, attention_mask, i, i1, i2)
-        pi12, pi22 = self.logit_pair(ids_M2, attention_mask, i, i1, i2)
-        # Could use log-cosh here?
-        return torch.abs(pj11 - pj12 - pj21 + pj22 - pi11 + pi21 + pi12 - pi22).mean()
-
-class AblatedCoherentBert(Bert):
-    def forward(self, input_ids, attention_mask, masked_lm_labels, reg_ids_1M, reg_ids_2M, reg_ids_M1, reg_ids_M2, i, j, reg_attn_mask, num_masked=None, ratio=None):
-        reg_1M_out = torch.where(reg_ids_1M == 3, -100, reg_ids_1M)  # Padding token hard-coded as 3... -100 (ignore output) also hard-coded above
-        reg_2M_out = torch.where(reg_ids_2M == 3, -100, reg_ids_2M)
-        reg_M1_out = torch.where(reg_ids_M1 == 3, -100, reg_ids_M1)
-        reg_M2_out = torch.where(reg_ids_M2 == 3, -100, reg_ids_M2)
-        if num_masked is None:
-            loss, accuracy, z_loss, num_tokens = super().forward(input_ids, attention_mask, masked_lm_labels, num_masked, ratio)
-            l1M, _, _, _ = super().forward(reg_ids_1M, reg_attn_mask, reg_1M_out, num_masked, ratio)
-            l2M, _, _, _ = super().forward(reg_ids_2M, reg_attn_mask, reg_2M_out, num_masked, ratio)
-            lM1, _, _, _ = super().forward(reg_ids_M1, reg_attn_mask, reg_M1_out, num_masked, ratio)
-            lM2, _, _, _ = super().forward(reg_ids_M2, reg_attn_mask, reg_M2_out, num_masked, ratio)
-            aux_loss = l1M + l2M + lM1 + lM2
-            return loss, accuracy, z_loss, num_tokens, aux_loss
-        else:
-            loss, masked_loss, causal_loss, accuracy, masked_accuracy, causal_accuracy, z_loss, num_tokens = super().forward(input_ids, attention_mask, masked_lm_labels, num_masked, ratio)
-            l1M, _, _, _, _, _, _, _ = super().forward(reg_ids_1M, reg_attn_mask, reg_1M_out, num_masked, ratio)
-            l2M, _, _, _, _, _, _, _ = super().forward(reg_ids_2M, reg_attn_mask, reg_2M_out, num_masked, ratio)
-            lM1, _, _, _, _, _, _, _ = super().forward(reg_ids_M1, reg_attn_mask, reg_M1_out, num_masked, ratio)
-            lM2, _, _, _, _, _, _, _ = super().forward(reg_ids_M2, reg_attn_mask, reg_M2_out, num_masked, ratio)
-            aux_loss = l1M + l2M + lM1 + lM2
-            return loss, masked_loss, causal_loss, accuracy, masked_accuracy, causal_accuracy, z_loss, num_tokens, aux_loss
-
 
 # From https://github.com/epfml/DenseFormer
 class InPlaceSetSlice(torch.autograd.Function):
