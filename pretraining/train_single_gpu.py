@@ -197,10 +197,13 @@ def save(model, ema_model, optimizer, scheduler, global_step, masked_epoch, caus
             args.output_path.replace(".bin", "_state_dict.bin")
         )
 
+from torch.utils.data import DataLoader
+from datasets import MaskedDataset, CausalDataset, ValidationDataset
 
 def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="masked"):
     train_seed = args.seed + epoch
 
+    # dynamic sequence length & batch scaling
     if (global_step + 1) / args.max_steps >= 0.9:
         seq_length = args.seq_length * 4
         global_batch_size = args.global_batch_size // 4
@@ -211,16 +214,14 @@ def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="ma
         seq_length = args.seq_length
         global_batch_size = args.global_batch_size
     
-    if mode == "masked":
-    	ratio = args.hybrid_numerator / args.hybrid_denominator
-    else:
-    	ratio = 1 - (args.hybrid_numerator / args.hybrid_denominator)
+    ratio = args.hybrid_numerator / args.hybrid_denominator if mode == "masked" else 1 - (args.hybrid_numerator / args.hybrid_denominator)
 
+    # reload dataset if seq_length changed
     if train_dataloader is None or train_dataloader.dataset.seq_length != seq_length:
         if mode == "masked":
-            train_data = MaskedDataset(args.train_path, tokenizer, args, seq_length, None, None)
+            train_data = MaskedDataset(args.train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
         else:
-            train_data = CausalDataset(args.train_path, tokenizer, args, seq_length, None, None)
+            train_data = CausalDataset(args.train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
         train_data.show_random_item(tokenizer)
     else:
         train_data = train_dataloader.dataset
@@ -228,7 +229,7 @@ def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="ma
     # linear batch size scaling
     args.current_global_batch_size = int(global_batch_size / args.batch_reduction * (1 - global_step / args.max_steps) + global_batch_size * (global_step / args.max_steps) + 0.5)
     total_local_batch_size = int(args.current_global_batch_size * ratio + 0.5)
-    if total_local_batch_size:
+    if total_local_batch_size == 0:
         total_local_batch_size = 1
         print(f"WARNING: The current {mode} ratio gives a batch size smaller than 1, the batch size is now set to 1.")
 
@@ -236,7 +237,7 @@ def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="ma
         train_data,
         shuffle=True,
         batch_size=total_local_batch_size,
-        num_workers=0,  # non-zero num_workers causes segmenation fault
+        num_workers=0,
         generator=torch.Generator().manual_seed(train_seed),
         drop_last=True,
         pin_memory=True,
@@ -246,7 +247,6 @@ def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="ma
 
 def init_datasets(args, tokenizer):
     train_seed = args.seed
-
     seq_length = args.seq_length
     global_batch_size = args.global_batch_size
     args.ratio = args.hybrid_numerator / args.hybrid_denominator
@@ -254,8 +254,12 @@ def init_datasets(args, tokenizer):
     # linear batch size scaling
     args.current_global_batch_size = int(global_batch_size / args.batch_reduction + 0.5)
 
+    masked_train_dataloader = None
+    causal_train_dataloader = None
+
+    # masked dataset
     if args.ratio != 0:
-        masked_train_data = MaskedDataset(args.train_path, tokenizer, args, seq_length, None, None)
+        masked_train_data = MaskedDataset(args.train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
         masked_train_data.show_random_item(tokenizer)
 
         total_masked_local_batch_size = int(args.current_global_batch_size * args.ratio + 0.5)
@@ -267,16 +271,15 @@ def init_datasets(args, tokenizer):
             masked_train_data,
             shuffle=True,
             batch_size=total_masked_local_batch_size,
-            num_workers=0,  # non-zero num_workers causes segmenation fault
+            num_workers=0,
             generator=torch.Generator().manual_seed(train_seed),
             drop_last=True,
             pin_memory=True,
         )
-    else:
-        masked_train_dataloader = None
 
+    # causal dataset
     if args.ratio != 1:
-        causal_train_data = CausalDataset(args.train_path, tokenizer, args, seq_length, None, None)
+        causal_train_data = CausalDataset(args.train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
         causal_train_data.show_random_item(tokenizer)
 
         total_causal_local_batch_size = int(args.current_global_batch_size * (1 - args.ratio) + 0.5)
@@ -288,16 +291,15 @@ def init_datasets(args, tokenizer):
             causal_train_data,
             shuffle=True,
             batch_size=total_causal_local_batch_size,
-            num_workers=0,  # non-zero num_workers causes segmenation fault
+            num_workers=0,
             generator=torch.Generator().manual_seed(train_seed),
             drop_last=True,
             pin_memory=True,
         )
-    else:
-        causal_train_dataloader = None
-    
-    valid_dataloader = ValidationDataset(args.valid_path, tokenizer, args)
-    
+
+    # validation dataset
+    valid_dataloader = ValidationDataset(args.valid_shard_dir, tokenizer, args, rank=None, world_size=None)
+
     return masked_train_dataloader, causal_train_dataloader, valid_dataloader
 
 
