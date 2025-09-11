@@ -1,0 +1,24 @@
+# Core libraries
+torch>=2.0.0
+tqdm
+numpy
+tokenizers
+wandb
+
+# If you use JSON configs, dataloaders, and other utils
+protobuf>=3.20.0
+scikit-learn
+
+# Optional: GPU-related
+nvidia-cublas-cu12>=12.1
+nvidia-cuda-runtime-cu12>=12.1
+nvidia-pyindex
+nvidia-tensorrt
+
+# Custom dependencies (you must provide or install manually)
+# If these are local modules, they must be in your PYTHONPATH
+# - lamb.py
+# - model_extra.py
+# - utils.py
+# - dataset.py
+# - model_logging.py
