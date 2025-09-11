@@ -82,7 +82,7 @@ class MaskedDataset(torch.utils.data.Dataset):
 
         self.masking_strategy = SpanMaskingStrategy(args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index)
 
-        documents = torch.load(input_file)
+        documents = torch.load(input_file, weights_only=False)
         self.segments = [
             document[offset : offset + self.seq_length - 2]
             for document in documents
