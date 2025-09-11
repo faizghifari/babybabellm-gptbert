@@ -216,9 +216,9 @@ def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="ma
     # reload dataset if seq_length changed
     if train_dataloader is None or train_dataloader.dataset.seq_length != seq_length:
         if mode == "masked":
-            train_data = MaskedDataset(args.train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+            train_data = MaskedDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
         else:
-            train_data = CausalDataset(args.train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+            train_data = CausalDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
         train_data.show_random_item(tokenizer)
     else:
         train_data = train_dataloader.dataset
@@ -256,7 +256,7 @@ def init_datasets(args, tokenizer):
 
     # masked dataset
     if args.ratio != 0:
-        masked_train_data = MaskedDataset(args.train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+        masked_train_data = MaskedDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
         masked_train_data.show_random_item(tokenizer)
 
         total_masked_local_batch_size = int(args.current_global_batch_size * args.ratio + 0.5)
@@ -276,7 +276,7 @@ def init_datasets(args, tokenizer):
 
     # causal dataset
     if args.ratio != 1:
-        causal_train_data = CausalDataset(args.train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+        causal_train_data = CausalDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
         causal_train_data.show_random_item(tokenizer)
 
         total_causal_local_batch_size = int(args.current_global_batch_size * (1 - args.ratio) + 0.5)
@@ -295,8 +295,7 @@ def init_datasets(args, tokenizer):
         )
 
     # validation dataset
-    valid_dataloader = ValidationDataset(args.valid_shard_dir, tokenizer, args, rank=None, world_size=None)
-
+    valid_dataloader = ValidationDataset(args.valid_path, tokenizer, args, rank=None, world_size=None)
     return masked_train_dataloader, causal_train_dataloader, valid_dataloader
 
 
