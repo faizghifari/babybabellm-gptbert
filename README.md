@@ -21,3 +21,36 @@ pip3 install -r requirements.txt
 cd tokenizers
 python3 tokenizer.py
 ```
+
+
+## BabyLM Tokenization & Sharding Pipeline
+
+This repository provides scripts to tokenize multilingual BabyLM datasets, save them as PyTorch-compatible tensors, and split them into manageable shards for training.
+
+1. **Encoding and Conversion**
+
+   The script `encode_and_convert.py` processes the datasets in two steps:
+
+   1. **Streaming uint16 `.bin`**  
+      All token IDs are concatenated and written to a `.bin` file using `save_bin_stream`.  
+      Example outputs:
+      - `../data/babybabellm_all.bin` (train)  
+      - `../data/dev_babybabellm.bin` (validation)
+
+   2. **Convert to Torch tensor**  
+      The uint16 `.bin` files are loaded into a single NumPy array and converted into a single `torch.LongTensor` using `convert_uint16_bin_to_torch`.  
+      Example outputs:
+      - `../data/babybabellm_all_torch.bin` (train)  
+      - `../data/dev_babybabellm_torch.bin` (validation)
+
+   ⚠️ Note: These are single tensors containing all tokens concatenated, **not a list of documents**.
+
+2. **Sharding**
+
+   The script `split_dataset.py` (modified for single tensors) splits the huge tensor into smaller shards suitable for training:
+
+   ```
+   python split_dataset.py
+   ```
+   
+This creates shards in  `../data/shards/train/` and  `../data/shards/valid/`. Each shard is a smaller tensor that can be efficiently loaded during training.
