@@ -4,7 +4,8 @@ tqdm
 numpy
 tokenizers
 wandb
-
+datasets
+transformers
 # If you use JSON configs, dataloaders, and other utils
 protobuf>=3.20.0
 scikit-learn
