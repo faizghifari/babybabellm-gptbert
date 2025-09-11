@@ -197,9 +197,6 @@ def save(model, ema_model, optimizer, scheduler, global_step, masked_epoch, caus
             args.output_path.replace(".bin", "_state_dict.bin")
         )
 
-from torch.utils.data import DataLoader
-from datasets import MaskedDataset, CausalDataset, ValidationDataset
-
 def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="masked"):
     train_seed = args.seed + epoch
 
