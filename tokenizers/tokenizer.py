@@ -1,13 +1,12 @@
+import os
+import json
+import numpy as np
 from datasets import load_dataset, concatenate_datasets, DatasetDict
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
 from tokenizers.trainers import BpeTrainer
 from tokenizers import pre_tokenizers, normalizers, decoders
-import numpy as np
-import os
-import json
 from multiprocessing import Pool, cpu_count
-from functools import partial
 
 # -----------------------------
 # 1. Languages
@@ -45,7 +44,7 @@ multiling_ds = load_all_splits(langs)
 print(multiling_ds)
 
 # -----------------------------
-# 3. Train tokenizer
+# 3. Tokenizer training
 # -----------------------------
 special_tokens = ["<unk>", "<s>", "</s>", "<pad>", "<mask>"] + [f"<special_{i}>" for i in range(11)]
 tokenizer = Tokenizer(BPE(unk_token="<unk>"))
@@ -54,20 +53,21 @@ tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
 tokenizer.decoder = decoders.ByteLevel()
 trainer = BpeTrainer(vocab_size=32768, special_tokens=special_tokens)
 
-def iterator():
-    for example in multiling_ds["train"]:
-        yield example["text"]
+# Streaming iterator for training
+def iterator_stream(batch_size=10000):
+    ds = multiling_ds["train"]
+    for i in range(0, len(ds), batch_size):
+        yield ds[i:i+batch_size]["text"]
 
-print("Training tokenizer...")
-tokenizer.train_from_iterator(iterator(), trainer)
-
+print("Training tokenizer (streaming)...")
+tokenizer.train_from_iterator(iterator_stream(batch_size=10000), trainer)
 os.makedirs("../tokenizers", exist_ok=True)
 tok_path = "../tokenizers/tokenizer.json"
 tokenizer.save(tok_path)
 print(f"✅ Tokenizer saved at {tok_path}")
 
 # -----------------------------
-# 4. Parallelized encoding
+# 4. Parallel encoding
 # -----------------------------
 def encode_batch(batch):
     return {"input_ids": [tokenizer.encode(text).ids for text in batch["text"]]}
@@ -77,55 +77,69 @@ num_cpus = cpu_count()
 tokenized_ds = multiling_ds.map(
     encode_batch,
     batched=True,
-    batch_size=1000,
+    batch_size=5000,  # larger batch to reduce overhead
     remove_columns=["text"],
     num_proc=num_cpus
 )
-print("✅ Parallelized tokenization complete")
+print("✅ Parallel encoding complete")
 
 # -----------------------------
-# 5. Parallel .bin saving
+# 5. Memory-mapped parallel .bin saving
 # -----------------------------
-def save_chunk(start_idx, end_idx, dataset, tmp_dir, chunk_id):
-    """Encode and save a dataset chunk to a temporary .bin file."""
-    arr = np.concatenate([np.array(ids, dtype=np.uint16) for ids in dataset["input_ids"][start_idx:end_idx]])
-    tmp_path = os.path.join(tmp_dir, f"chunk_{chunk_id}.bin")
-    arr.tofile(tmp_path)
-    return tmp_path, len(arr)
-
-def save_bin_parallel(dataset, path, n_chunks=None):
+def save_bin_memmap(dataset, path):
+    """Save token IDs using memory-mapped array and parallel processing."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_dir = os.path.join(os.path.dirname(path), "tmp_chunks")
-    os.makedirs(tmp_dir, exist_ok=True)
-
     n_examples = len(dataset)
-    if n_chunks is None:
-        n_chunks = cpu_count() * 2  # more chunks than CPUs for load balancing
+    
+    # Compute total tokens
+    print("Calculating total token count...")
+    total_tokens = sum(len(ids) for ids in dataset["input_ids"])
+    
+    print(f"Total tokens: {total_tokens}")
+    
+    # Create memmap
+    mmap = np.memmap(path, dtype=np.uint16, mode='w+', shape=(total_tokens,))
+    
+    # Function to write a slice of data
+    def write_slice(start_idx, end_idx, offset):
+        for i, ids in enumerate(dataset["input_ids"][start_idx:end_idx]):
+            mmap[offset:offset+len(ids)] = ids
+            offset += len(ids)
+        return offset
+
+    # Split dataset into chunks for parallel writing
+    n_chunks = num_cpus * 2
     chunk_size = (n_examples + n_chunks - 1) // n_chunks
-    chunks = [(i*chunk_size, min((i+1)*chunk_size, n_examples), dataset, tmp_dir, i) for i in range(n_chunks)]
+    chunks = []
+    offsets = []
+    current_offset = 0
+    for i in range(n_chunks):
+        start = i * chunk_size
+        end = min((i + 1) * chunk_size, n_examples)
+        token_count = sum(len(ids) for ids in dataset["input_ids"][start:end])
+        chunks.append((start, end, current_offset))
+        offsets.append(token_count)
+        current_offset += token_count
 
-    print(f"Saving {n_examples} examples in {n_chunks} parallel chunks...")
-    total_tokens = 0
-    tmp_files = []
+    # Parallel write
+    def write_chunk(args):
+        start_idx, end_idx, offset = args
+        for i, ids in enumerate(dataset["input_ids"][start_idx:end_idx]):
+            mmap[offset:offset+len(ids)] = ids
+            offset += len(ids)
+    
+    print(f"Writing {n_examples} examples in {n_chunks} parallel chunks...")
     with Pool(n_chunks) as pool:
-        for tmp_path, n_tokens in pool.starmap(save_chunk, chunks):
-            tmp_files.append(tmp_path)
-            total_tokens += n_tokens
-
-    # Merge temporary files into final .bin
-    with open(path, "wb") as f_out:
-        for tmp_file in tmp_files:
-            with open(tmp_file, "rb") as f_in:
-                f_out.write(f_in.read())
-            os.remove(tmp_file)  # remove temp file
-
-    os.rmdir(tmp_dir)
+        pool.map(write_chunk, chunks)
+    
+    mmap.flush()
+    del mmap
     print(f"✅ Saved {path} ({total_tokens} tokens)")
 
 train_bin = "../data/babybabellm_all.bin"
 val_bin = "../data/dev_babybabellm.bin"
-save_bin_parallel(tokenized_ds["train"], train_bin)
-save_bin_parallel(tokenized_ds["validation"], val_bin)
+save_bin_memmap(tokenized_ds["train"], train_bin)
+save_bin_memmap(tokenized_ds["validation"], val_bin)
 
 # -----------------------------
 # 6. Save meta file
@@ -142,4 +156,3 @@ meta_path = "../data/meta.json"
 with open(meta_path, "w", encoding="utf-8") as f:
     json.dump(meta, f, ensure_ascii=False, indent=2)
 print(f"✅ Meta file saved at {meta_path}")
-
