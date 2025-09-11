@@ -1,6 +1,7 @@
 import os
 import torch
 import random
+from torch.utils.data import Dataset
 
 # ===== Masking and helper classes =====
 class SpanMaskingStrategy:
@@ -69,9 +70,20 @@ def load_shard(shard_file):
     return torch.load(shard_file, weights_only=False)
 
 
+# ===== Common show_random_item() =====
+def show_random_item(self, tokenizer):
+    index = random.randint(0, len(self) - 1)
+    input_ids, target_ids, attention_mask, real_mask_p = self[index]  # triggers lazy shard load
+    print("Random item sample:")
+    print("Input ids:", input_ids)
+    print("Target ids:", target_ids)
+    print("Attention mask shape:", attention_mask.shape)
+    print("Mask ratio:", real_mask_p)
+
+
 # ===== Masked Dataset =====
-class MaskedDataset(torch.utils.data.Dataset):
-    def __init__(self, shard_dir: str, tokenizer, args, seq_length, rank=None, world_size=None):
+class MaskedDataset(Dataset):
+    def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         self.seq_length = seq_length
         self.n_special_tokens = args.n_special_tokens
         self.args = args
@@ -101,6 +113,8 @@ class MaskedDataset(torch.utils.data.Dataset):
         for shard_idx, shard_file in enumerate(self.shard_files):
             documents = load_shard(shard_file)
             for doc_idx, doc in enumerate(documents):
+                if doc.dim() == 0:
+                    doc = doc.unsqueeze(0)
                 for offset in range(0, len(doc), self.seq_length - 2):
                     if len(doc) > 1:
                         start = offset
@@ -167,9 +181,13 @@ class MaskedDataset(torch.utils.data.Dataset):
         return input_ids, target_ids, real_mask_p
 
 
+# Attach show_random_item
+MaskedDataset.show_random_item = show_random_item
+
+
 # ===== Causal Dataset =====
-class CausalDataset(torch.utils.data.Dataset):
-    def __init__(self, shard_dir: str, tokenizer, args, seq_length, rank=None, world_size=None):
+class CausalDataset(Dataset):
+    def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         self.seq_length = seq_length
         self.n_special_tokens = args.n_special_tokens
         self.args = args
@@ -189,6 +207,8 @@ class CausalDataset(torch.utils.data.Dataset):
         for shard_idx, shard_file in enumerate(self.shard_files):
             documents = load_shard(shard_file)
             for doc_idx, doc in enumerate(documents):
+                if doc.dim() == 0:
+                    doc = doc.unsqueeze(0)
                 for offset in range(0, len(doc), self.seq_length - 2):
                     if len(doc) > 1:
                         start = offset
@@ -236,13 +256,13 @@ class CausalDataset(torch.utils.data.Dataset):
 
         return input_ids, target_ids, attention_mask, torch.zeros([])
 
-    def set_global_step(self, global_step):
-        self.global_step = global_step
+
+CausalDataset.show_random_item = show_random_item
 
 
 # ===== Validation Dataset =====
-class ValidationDataset(torch.utils.data.Dataset):
-    def __init__(self, shard_dir: str, tokenizer, args, rank=None, world_size=None, seed=42):
+class ValidationDataset(Dataset):
+    def __init__(self, shard_dir, tokenizer, args, rank=None, world_size=None, seed=42):
         self.seq_length = args.seq_length
         self.n_special_tokens = args.n_special_tokens
 
@@ -250,7 +270,13 @@ class ValidationDataset(torch.utils.data.Dataset):
         self.pad_index = tokenizer.token_to_id("<pad>")
 
         self.mask_index = tokenizer.token_to_id("<mask>")
-        self.masking_strategy = SpanMaskingStrategy(args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index)
+        self.masking_strategy = SpanMaskingStrategy(
+            args.n_special_tokens,
+            args.mask_random_p,
+            args.mask_keep_p,
+            args.vocab_size,
+            self.mask_index
+        )
 
         self.shard_files = sorted([os.path.join(shard_dir, f) for f in os.listdir(shard_dir) if f.endswith(".bin")])
         if rank is not None and world_size is not None:
@@ -263,6 +289,8 @@ class ValidationDataset(torch.utils.data.Dataset):
         for shard_idx, shard_file in enumerate(self.shard_files):
             documents = load_shard(shard_file)
             for doc_idx, doc in enumerate(documents):
+                if doc.dim() == 0:
+                    doc = doc.unsqueeze(0)
                 for offset in range(0, len(doc), self.seq_length - 2):
                     if len(doc) > 1:
                         start = offset
