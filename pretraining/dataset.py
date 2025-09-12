@@ -1,4 +1,3 @@
-# dataset.py
 # coding=utf-8
 
 import os
@@ -22,6 +21,8 @@ class SpanMaskingStrategy:
 
     def __call__(self, tokens, counts=None):
         length = tokens.size(0)
+        if length == 0:
+            return torch.tensor([]), tokens.clone()
 
         span_lengths = torch.randint(1, self.max_span_length + 1, size=(length,), dtype=torch.int)
         cumsum = torch.cumsum(span_lengths, dim=0)
@@ -79,20 +80,17 @@ class RandomIndex:
         return index
 
 
-# ===== shard loader & index builder (with caching) =====
+# ===== shard loader & index builder =====
 def load_shard(shard_file):
     return torch.load(shard_file, weights_only=False)
 
 
 def _build_segment_index_for_shard(shard_file, seq_length):
-    """Return list of (doc_idx, start, end) for a single shard (no shard_idx)."""
     segments = []
     documents = load_shard(shard_file)
     for doc_idx, doc in enumerate(documents):
-        # convert 0-d tensor to 1-d
         if isinstance(doc, torch.Tensor) and doc.dim() == 0:
             doc = doc.unsqueeze(0)
-        # convert list/other to tensor
         if not isinstance(doc, torch.Tensor):
             try:
                 doc = torch.tensor(doc, dtype=torch.long)
@@ -179,9 +177,11 @@ class MaskedDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
 
+        if len(self.shard_indices) == 0:
+            raise ValueError(f"No segments found in {shard_dir}, dataset is empty!")
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
-
         self.counts = [None] * len(self.shard_indices)
         self.mask_counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
@@ -236,8 +236,9 @@ class MaskedDataset(Dataset):
 
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
         mask_p = self.args.mask_p_start + (self.args.mask_p_end - self.args.mask_p_start) * self.global_step / max(1, self.args.max_steps)
-        mask_p = torch.topk(mask_ratios, max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item())), largest=False).values.max().item()
-        mask = mask_ratios <= mask_p
+        topk = max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item()))
+        mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
+        mask = mask_ratios <= mask_threshold
         target_ids = torch.where(mask, input_ids, -100)
         input_ids = torch.where(mask, replacement_ids, input_ids)
         real_mask_p = mask.sum() / mask_ratios.numel()
@@ -261,9 +262,11 @@ class CausalDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
 
+        if len(self.shard_indices) == 0:
+            raise ValueError(f"No segments found in {shard_dir}, dataset is empty!")
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
-
         self.counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
 
@@ -283,7 +286,6 @@ class CausalDataset(Dataset):
     def __getitem__(self, index):
         tokens = self._load_segment(index)
         seq_length = min(self.seq_length, tokens.size(0))
-
         if self.counts[index] is None:
             self.counts[index] = torch.zeros_like(tokens)
         self.counts[index][:seq_length] += 1
@@ -330,6 +332,9 @@ class ValidationDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{self.seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, self.seq_length, cache_file, rank, world_size)
 
+        if len(self.shard_indices) == 0:
+            raise ValueError(f"No segments found in {shard_dir}, dataset is empty!")
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
 
@@ -374,8 +379,9 @@ class ValidationDataset(Dataset):
 
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
         mask_p = 0.15
-        mask_p = torch.topk(mask_ratios, max(1, int(mask_ratios.size(0) * mask_p + 0.5)), largest=False).values.max().item()
-        mask = mask_ratios < mask_p
+        topk = max(1, int(mask_ratios.size(0) * mask_p + 0.5))
+        mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
+        mask = mask_ratios < mask_threshold
         target_ids = torch.where(mask, input_ids, -100)
         input_ids = torch.where(mask, replacement_ids, input_ids)
         real_mask_p = mask.sum() / mask_ratios.numel()
@@ -385,3 +391,4 @@ class ValidationDataset(Dataset):
 ValidationDataset.show_random_item = show_random_item
 
 __all__ = ["MaskedDataset", "CausalDataset", "ValidationDataset"]
+
