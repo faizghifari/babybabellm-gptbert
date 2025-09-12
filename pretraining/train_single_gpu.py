@@ -265,8 +265,8 @@ def init_datasets(args, tokenizer):
     masked_train_dataloader = None
     causal_train_dataloader = None
 
-    train_shard_dir = os.path.join(os.path.dirname(args.train_path), "shards/train")
-    valid_shard_dir = os.path.join(os.path.dirname(args.valid_path), "shards/valid")
+    train_shard_dir = args.train_path
+    valid_shard_dir = args.valid_path
 
     # masked dataset
     if args.ratio != 0:
