@@ -196,7 +196,6 @@ def save(model, ema_model, optimizer, scheduler, global_step, masked_epoch, caus
             },
             args.output_path.replace(".bin", "_state_dict.bin")
         )
-
 def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="masked"):
     train_seed = args.seed + epoch
 
@@ -216,14 +215,19 @@ def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="ma
     # reload dataset if seq_length changed
     if train_dataloader is None or train_dataloader.dataset.seq_length != seq_length:
         if mode == "masked":
-            train_data = MaskedDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
+            train_data = MaskedDataset(
+                os.path.join(os.path.dirname(args.train_path), "shards/train"), 
+                tokenizer, args, seq_length, rank=None, world_size=None
+            )
         else:
-            train_data = CausalDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
+            train_data = CausalDataset(
+                os.path.join(os.path.dirname(args.train_path), "shards/train"), 
+                tokenizer, args, seq_length, rank=None, world_size=None
+            )
 
-        # show lazy-loaded random item with progress bar
-        print(f"Inspecting a random {mode} item (lazy loading a shard)...")
-        for _ in tqdm(range(1), desc="Loading shard for sample"):
-            train_data.show_random_item(tokenizer)
+        # safe lazy sample check
+        print(f"Inspecting a random {mode} item (lazy shard loading)...")
+        train_data.show_random_item(tokenizer)
     else:
         train_data = train_dataloader.dataset
 
@@ -261,12 +265,14 @@ def init_datasets(args, tokenizer):
     masked_train_dataloader = None
     causal_train_dataloader = None
 
+    train_shard_dir = os.path.join(os.path.dirname(args.train_path), "shards/train")
+    valid_shard_dir = os.path.join(os.path.dirname(args.valid_path), "shards/valid")
+
     # masked dataset
     if args.ratio != 0:
         print("Initializing masked dataset...")
-        masked_train_data = MaskedDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
-        for _ in tqdm(range(1), desc="Loading shard for sample (masked)"):
-            masked_train_data.show_random_item(tokenizer)
+        masked_train_data = MaskedDataset(train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+        masked_train_data.show_random_item(tokenizer)
 
         total_masked_local_batch_size = int(args.current_global_batch_size * args.ratio + 0.5)
         if total_masked_local_batch_size == 0:
@@ -286,9 +292,8 @@ def init_datasets(args, tokenizer):
     # causal dataset
     if args.ratio != 1:
         print("Initializing causal dataset...")
-        causal_train_data = CausalDataset(args.train_path, tokenizer, args, seq_length, rank=None, world_size=None)
-        for _ in tqdm(range(1), desc="Loading shard for sample (causal)"):
-            causal_train_data.show_random_item(tokenizer)
+        causal_train_data = CausalDataset(train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+        causal_train_data.show_random_item(tokenizer)
 
         total_causal_local_batch_size = int(args.current_global_batch_size * (1 - args.ratio) + 0.5)
         if total_causal_local_batch_size == 0:
@@ -307,7 +312,7 @@ def init_datasets(args, tokenizer):
 
     # validation dataset
     print("Initializing validation dataset...")
-    valid_dataloader = ValidationDataset(args.valid_path, tokenizer, args, rank=None, world_size=None)
+    valid_dataloader = ValidationDataset(valid_shard_dir, tokenizer, args, rank=None, world_size=None)
     return masked_train_dataloader, causal_train_dataloader, valid_dataloader
 
 def training_epoch(model, ema_model, train_dataloader, valid_dataloader, optimizer, scheduler, global_step, epoch, args):
