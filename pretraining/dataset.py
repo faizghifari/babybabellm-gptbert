@@ -8,16 +8,15 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset
 
-
 # ===== Masking and helper classes =====
 class SpanMaskingStrategy:
-    def __init__(self, n_special_tokens, random_p, keep_p, vocab_size, mask_token_id):
+    def __init__(self, n_special_tokens, random_p, keep_p, vocab_size, mask_token_id, max_span_length=3):
         self.n_special_tokens = n_special_tokens
         self.random_p = random_p
         self.keep_p = keep_p
         self.vocab_size = vocab_size
         self.mask_token_id = mask_token_id
-        self.max_span_length = 3
+        self.max_span_length = max_span_length
 
     def __call__(self, tokens, counts=None):
         length = tokens.size(0)
@@ -63,10 +62,7 @@ class SpanMaskingStrategy:
 class RandomIndex:
     def __init__(self, n_segments):
         self.n_segments = n_segments
-        if n_segments > 0:
-            self.indices = torch.randperm(n_segments)
-        else:
-            self.indices = torch.tensor([], dtype=torch.long)
+        self.indices = torch.randperm(n_segments) if n_segments > 0 else torch.tensor([], dtype=torch.long)
         self.index = 0
 
     def get_random_index(self):
@@ -75,9 +71,9 @@ class RandomIndex:
         if self.index >= self.n_segments:
             self.indices = torch.randperm(self.n_segments)
             self.index = 0
-        index = int(self.indices[self.index].item())
+        idx = int(self.indices[self.index].item())
         self.index += 1
-        return index
+        return idx
 
 
 # ===== shard loader & index builder =====
@@ -133,6 +129,9 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
             print(f"Warning: failed processing shard {shard_file}: {e}")
             continue
 
+    if len(shard_indices) == 0:
+        raise ValueError(f"No segments found in {shard_dir}, dataset is empty! Check shard files or seq_length.")
+
     try:
         tmp_cache = cache_file + ".tmp"
         with open(tmp_cache, "wb") as f:
@@ -176,9 +175,6 @@ class MaskedDataset(Dataset):
 
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
-
-        if len(self.shard_indices) == 0:
-            raise ValueError(f"No segments found in {shard_dir}, dataset is empty!")
 
         self._loaded_shard = None
         self._loaded_shard_idx = None
@@ -252,8 +248,8 @@ MaskedDataset.show_random_item = show_random_item
 class CausalDataset(Dataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         self.seq_length = seq_length
-        self.n_special_tokens = args.n_special_tokens
         self.args = args
+        self.n_special_tokens = args.n_special_tokens
         self.global_step = 0
 
         self.cls_index = tokenizer.token_to_id("<s>")
@@ -261,9 +257,6 @@ class CausalDataset(Dataset):
 
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
-
-        if len(self.shard_indices) == 0:
-            raise ValueError(f"No segments found in {shard_dir}, dataset is empty!")
 
         self._loaded_shard = None
         self._loaded_shard_idx = None
@@ -332,11 +325,11 @@ class ValidationDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{self.seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, self.seq_length, cache_file, rank, world_size)
 
-        if len(self.shard_indices) == 0:
-            raise ValueError(f"No segments found in {shard_dir}, dataset is empty!")
-
         self._loaded_shard = None
         self._loaded_shard_idx = None
+
+        if len(self.shard_indices) == 0:
+            raise ValueError(f"No segments found in {shard_dir}, dataset is empty!")
 
         rng = random.Random(rank if rank is not None else seed)
         rng.shuffle(self.shard_indices)
@@ -390,5 +383,6 @@ class ValidationDataset(Dataset):
 
 ValidationDataset.show_random_item = show_random_item
 
-__all__ = ["MaskedDataset", "CausalDataset", "ValidationDataset"]
 
+# ===== Export =====
+__all__ = ["MaskedDataset", "CausalDataset", "ValidationDataset", "RandomIndex", "SpanMaskingStrategy", "build_or_load_indices"]
