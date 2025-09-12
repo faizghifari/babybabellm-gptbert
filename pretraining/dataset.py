@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 
-# ===== Masking and helper classes =====
+# ===== Masking strategy =====
 class SpanMaskingStrategy:
     def __init__(self, n_special_tokens, random_p, keep_p, vocab_size, mask_token_id):
         self.n_special_tokens = n_special_tokens
@@ -59,6 +59,7 @@ class SpanMaskingStrategy:
         return mask_ratios, replacement_tokens
 
 
+# ===== RandomIndex helper =====
 class RandomIndex:
     def __init__(self, n_segments):
         self.n_segments = n_segments
@@ -79,7 +80,7 @@ class RandomIndex:
         return index
 
 
-# ===== shard loader & index builder =====
+# ===== Shard loader & index builder =====
 def load_shard(shard_file):
     return torch.load(shard_file, weights_only=False)
 
@@ -98,13 +99,17 @@ def _build_segment_index_for_shard(shard_file, seq_length):
         doc_len = doc.size(0)
         if doc_len == 0:
             continue
+
         step = max(1, seq_length - 2)
-        # ensure at least one segment per document
-        for offset in range(0, max(1, doc_len), step):
+        added = False
+        for offset in range(0, doc_len, step):
             start = offset
             end = min(offset + step, doc_len)
             segments.append((doc_idx, start, end))
-        if len(segments) == 0:
+            added = True
+
+        # fallback: if no segment was added (doc shorter than step), add the whole doc
+        if not added:
             segments.append((doc_idx, 0, doc_len))
     return segments
 
@@ -135,9 +140,11 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
             print(f"Warning: failed processing shard {shard_file}: {e}")
             continue
 
+    # Ensure we always have at least one segment
     if len(shard_indices) == 0:
-        print(f"Warning: no segments found in {shard_dir}, dataset will be empty!")
+        raise ValueError(f"No usable segments found in {shard_dir} with seq_length={seq_length}!")
 
+    # save cache
     try:
         tmp_cache = cache_file + ".tmp"
         with open(tmp_cache, "wb") as f:
@@ -149,7 +156,7 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
     return shard_indices, shard_files
 
 
-# ===== helper: show_random_item =====
+# ===== Helper: show random item =====
 def show_random_item(self, tokenizer):
     if len(self) == 0:
         print("Dataset empty: no item to show.")
@@ -181,9 +188,6 @@ class MaskedDataset(Dataset):
 
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
-
-        if len(self.shard_indices) == 0:
-            raise ValueError(f"No usable segments found in {shard_dir} with seq_length={seq_length}!")
 
         self._loaded_shard = None
         self._loaded_shard_idx = None
@@ -267,9 +271,6 @@ class CausalDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
 
-        if len(self.shard_indices) == 0:
-            raise ValueError(f"No usable segments found in {shard_dir} with seq_length={seq_length}!")
-
         self._loaded_shard = None
         self._loaded_shard_idx = None
         self.counts = [None] * len(self.shard_indices)
@@ -337,9 +338,6 @@ class ValidationDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{self.seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, self.seq_length, cache_file, rank, world_size)
 
-        if len(self.shard_indices) == 0:
-            raise ValueError(f"No usable segments found in {shard_dir} with seq_length={self.seq_length}!")
-
         self._loaded_shard = None
         self._loaded_shard_idx = None
 
@@ -396,4 +394,5 @@ class ValidationDataset(Dataset):
 ValidationDataset.show_random_item = show_random_item
 
 __all__ = ["MaskedDataset", "CausalDataset", "ValidationDataset"]
+
 
