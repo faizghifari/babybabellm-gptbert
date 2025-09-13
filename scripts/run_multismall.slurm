@@ -22,9 +22,16 @@ source /scripts/venvs/demo/bin/activate
 python -m pip install --upgrade pip
 pip install "torch>=2.0.0" tqdm numpy tokenizers wandb datasets transformers "protobuf>=3.20.0" scikit-learn
 
+# Go to root
+cd .. || exit 1
+
+# Build tokenizer
+cd tokenizers || exit 1
+python3 tokenizer.py
+cd .. || exit 1
+
 # Preprocess
 echo "Preprocessing /data/MULTILINGUAL-SMALL..."
-cd .. || exit 1   # go from /scripts -> root
 python preprocessing/updated_preprocess.py \
     --dataset_type multilingual_small \
     --tokenizer tokenizers/tokenizer.json \
