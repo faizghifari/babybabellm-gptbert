@@ -8,7 +8,7 @@ import torch
 from torch.utils.data import Dataset
 
 
-# ===== Masking strategy =====
+# ===== Masking and helper classes =====
 class SpanMaskingStrategy:
     def __init__(self, n_special_tokens, random_p, keep_p, vocab_size, mask_token_id):
         self.n_special_tokens = n_special_tokens
@@ -42,7 +42,6 @@ class SpanMaskingStrategy:
             mask_ratios = mask_ratios * counts_p
 
         mask_ratios[tokens < self.n_special_tokens] = float('inf')
-
         replacement_p = span_random_numbers_2[indices]
         random_mask = replacement_p < self.random_p
 
@@ -59,7 +58,6 @@ class SpanMaskingStrategy:
         return mask_ratios, replacement_tokens
 
 
-# ===== RandomIndex helper =====
 class RandomIndex:
     def __init__(self, n_segments):
         self.n_segments = n_segments
@@ -80,7 +78,7 @@ class RandomIndex:
         return index
 
 
-# ===== Shard loader & index builder =====
+# ===== shard loader & index builder =====
 def load_shard(shard_file):
     return torch.load(shard_file, weights_only=False)
 
@@ -89,8 +87,10 @@ def _build_segment_index_for_shard(shard_file, seq_length):
     segments = []
     documents = load_shard(shard_file)
     for doc_idx, doc in enumerate(documents):
+        # Handle 0-d tensor
         if isinstance(doc, torch.Tensor) and doc.dim() == 0:
             doc = doc.unsqueeze(0)
+        # Ensure tensor type
         if not isinstance(doc, torch.Tensor):
             try:
                 doc = torch.tensor(doc, dtype=torch.long)
@@ -108,9 +108,11 @@ def _build_segment_index_for_shard(shard_file, seq_length):
             segments.append((doc_idx, start, end))
             added = True
 
-        # fallback: if no segment was added (doc shorter than step), add the whole doc
         if not added:
             segments.append((doc_idx, 0, doc_len))
+
+    if len(segments) == 0 and len(documents) > 0:
+        segments.append((0, 0, 1))
     return segments
 
 
@@ -140,11 +142,10 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
             print(f"Warning: failed processing shard {shard_file}: {e}")
             continue
 
-    # Ensure we always have at least one segment
-    if len(shard_indices) == 0:
-        raise ValueError(f"No usable segments found in {shard_dir} with seq_length={seq_length}!")
+    if len(shard_indices) == 0 and len(shard_files) > 0:
+        print(f"Warning: no usable segments found in {shard_dir}, adding dummy segment")
+        shard_indices.append((0, 0, 1))
 
-    # save cache
     try:
         tmp_cache = cache_file + ".tmp"
         with open(tmp_cache, "wb") as f:
@@ -156,7 +157,7 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
     return shard_indices, shard_files
 
 
-# ===== Helper: show random item =====
+# ===== helper: show_random_item =====
 def show_random_item(self, tokenizer):
     if len(self) == 0:
         print("Dataset empty: no item to show.")
@@ -189,11 +190,18 @@ class MaskedDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
 
+        if len(self.shard_indices) == 0:
+            print(f"Warning: no segments found in {shard_dir}. Adding dummy segment.")
+            self.shard_indices.append((0, 0, 1))
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
         self.counts = [None] * len(self.shard_indices)
         self.mask_counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
+
+        # Show a random item for sanity check
+        self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
         shard_idx, doc_idx, start, end = self.shard_indices[index]
@@ -271,10 +279,17 @@ class CausalDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
 
+        if len(self.shard_indices) == 0:
+            print(f"Warning: no segments found in {shard_dir}. Adding dummy segment.")
+            self.shard_indices.append((0, 0, 1))
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
         self.counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
+
+        # Sanity check
+        self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
         shard_idx, doc_idx, start, end = self.shard_indices[index]
@@ -329,8 +344,8 @@ class ValidationDataset(Dataset):
 
         self.cls_index = tokenizer.token_to_id("<s>")
         self.pad_index = tokenizer.token_to_id("<pad>")
-
         self.mask_index = tokenizer.token_to_id("<mask>")
+
         self.masking_strategy = SpanMaskingStrategy(
             args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index
         )
@@ -338,11 +353,18 @@ class ValidationDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{self.seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, self.seq_length, cache_file, rank, world_size)
 
+        if len(self.shard_indices) == 0:
+            print(f"Warning: no segments found in {shard_dir}. Adding dummy segment.")
+            self.shard_indices.append((0, 0, 1))
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
 
         rng = random.Random(rank if rank is not None else seed)
         rng.shuffle(self.shard_indices)
+
+        # Sanity check
+        self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
         shard_idx, doc_idx, start, end = self.shard_indices[index]
@@ -394,5 +416,6 @@ class ValidationDataset(Dataset):
 ValidationDataset.show_random_item = show_random_item
 
 __all__ = ["MaskedDataset", "CausalDataset", "ValidationDataset"]
+
 
 
