@@ -8,8 +8,10 @@ from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset
 
-# ===== Masking and helper classes =====
+
+# ===== Helper Classes =====
 class SpanMaskingStrategy:
+    """Span masking with random replacement and mask/keep probabilities."""
     def __init__(self, n_special_tokens, random_p, keep_p, vocab_size, mask_token_id):
         self.n_special_tokens = n_special_tokens
         self.random_p = random_p
@@ -23,36 +25,34 @@ class SpanMaskingStrategy:
         if length == 0:
             return torch.tensor([]), tokens.clone()
 
-        span_lengths = torch.randint(1, self.max_span_length + 1, size=(length,), dtype=torch.int)
+        # Generate span lengths and mapping
+        span_lengths = torch.randint(1, self.max_span_length + 1, (length,))
         cumsum = torch.cumsum(span_lengths, dim=0)
         total_length = cumsum[-1].item()
         indices = torch.zeros(total_length, dtype=torch.int)
-        indices[cumsum - span_lengths] = torch.arange(length, dtype=torch.int)
-        indices = torch.cummax(indices, dim=0)[0]
-        indices = indices[:length]
+        indices[cumsum - span_lengths] = torch.arange(length)
+        indices = torch.cummax(indices, dim=0)[0][:length]
 
         max_index = indices[-1].item()
-        span_random_numbers_1, span_random_numbers_2 = torch.rand([(max_index + 1) * 2]).chunk(2)
-        mask_ratios = span_random_numbers_1[indices]
+        r1, r2 = torch.rand((max_index + 1) * 2).chunk(2)
+        mask_ratios = r1[indices]
 
         if counts is not None:
             counts = counts.float()
             counts[tokens < self.n_special_tokens] = float('-inf')
-            counts_p = torch.nn.functional.softmax(counts, dim=0)
-            mask_ratios = mask_ratios * counts_p
+            mask_ratios = mask_ratios * torch.nn.functional.softmax(counts, dim=0)
 
         mask_ratios[tokens < self.n_special_tokens] = float('inf')
 
-        replacement_p = span_random_numbers_2[indices]
+        replacement_p = r2[indices]
         random_mask = replacement_p < self.random_p
 
         replacement_tokens = tokens.clone()
-        if random_mask.sum().item() > 0:
+        if random_mask.sum() > 0:
             replacement_tokens[random_mask] = torch.randint(
                 low=self.n_special_tokens,
                 high=self.vocab_size,
-                size=[random_mask.sum().item()],
-                dtype=torch.long
+                size=(random_mask.sum().item(),),
             )
         replacement_tokens[replacement_p > (self.random_p + self.keep_p)] = self.mask_token_id
 
@@ -60,14 +60,13 @@ class SpanMaskingStrategy:
 
 
 class RandomIndex:
+    """Cycle through randomized indices."""
     def __init__(self, n_segments):
-        self.n_segments = n_segments
-        self.indices = torch.randperm(n_segments) if n_segments > 0 else torch.tensor([], dtype=torch.long)
+        self.n_segments = max(n_segments, 1)  # ensure at least 1
+        self.indices = torch.randperm(self.n_segments)
         self.index = 0
 
     def get_random_index(self):
-        if self.n_segments == 0:
-            raise IndexError("RandomIndex has zero segments")
         if self.index >= self.n_segments:
             self.indices = torch.randperm(self.n_segments)
             self.index = 0
@@ -76,14 +75,21 @@ class RandomIndex:
         return idx
 
 
-# ===== shard loader & index builder =====
+# ===== Shard loader & index builder =====
 def load_shard(shard_file):
+    if shard_file == "__dummy__":
+        return None  # dummy shard handled in dataset class
     return torch.load(shard_file, weights_only=False)
 
 
 def _build_segment_index_for_shard(shard_file, seq_length):
     segments = []
     documents = load_shard(shard_file)
+    if documents is None:
+        # dummy shard
+        segments.append((0, 0, 0, seq_length))
+        return segments
+
     for doc_idx, doc in enumerate(documents):
         if isinstance(doc, torch.Tensor) and doc.dim() == 0:
             doc = doc.unsqueeze(0)
@@ -115,7 +121,9 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
         except Exception:
             print(f"Warning: failed to load cache {cache_file}, rebuilding indices")
 
-    shard_files = sorted([os.path.join(shard_dir, f) for f in os.listdir(shard_dir) if f.endswith(".bin")])
+    shard_files = sorted(
+        [os.path.join(shard_dir, f) for f in os.listdir(shard_dir) if f.endswith(".bin")]
+    )
     if rank is not None and world_size is not None:
         shard_files = shard_files[rank::world_size]
 
@@ -129,12 +137,12 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
             print(f"Warning: failed processing shard {shard_file}: {e}")
             continue
 
-    # ===== dummy shard if empty =====
     if len(shard_indices) == 0:
-        print(f"Warning: no usable segments in {shard_dir}, adding dummy segment")
-        shard_files.append("__dummy__")
-        shard_indices.append((len(shard_files) - 1, 0, 0, seq_length))
+        print(f"Warning: no segments found in {shard_dir}. Adding dummy shard/segment.")
+        shard_files = ["__dummy__"]
+        shard_indices = [(0, 0, 0, seq_length)]
 
+    # Save cache
     try:
         tmp_cache = cache_file + ".tmp"
         with open(tmp_cache, "wb") as f:
@@ -146,7 +154,7 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
     return shard_indices, shard_files
 
 
-# ===== helper: show_random_item =====
+# ===== Random-sample sanity check =====
 def show_random_item(self, tokenizer):
     if len(self) == 0:
         print("Dataset empty: no item to show.")
@@ -164,8 +172,8 @@ def show_random_item(self, tokenizer):
 class MaskedDataset(Dataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         self.seq_length = seq_length
-        self.n_special_tokens = args.n_special_tokens
         self.args = args
+        self.n_special_tokens = args.n_special_tokens
         self.global_step = 0
 
         self.mask_index = tokenizer.token_to_id("<mask>")
@@ -179,21 +187,26 @@ class MaskedDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
 
+        # Dummy shard in memory for fallback
+        self._dummy_shard = [torch.full((seq_length,), self.pad_index, dtype=torch.long)]
+        if len(self.shard_indices) == 0:
+            print(f"Warning: adding dummy segment for empty dataset.")
+            self.shard_indices = [(0, 0, 0, seq_length)]
+            self.shard_files = ["__dummy__"]
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
-        self._dummy_shard = [torch.full((seq_length,), self.pad_index, dtype=torch.long)]
-
         self.counts = [None] * len(self.shard_indices)
         self.mask_counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
 
-        # Sanity check
+        # Show a sanity check
         self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
         shard_idx, doc_idx, start, end = self.shard_indices[index]
         if self.shard_files[shard_idx] == "__dummy__":
-            return self._dummy_shard[doc_idx]
+            return self._dummy_shard[0]
         if self._loaded_shard_idx != shard_idx:
             self._loaded_shard = load_shard(self.shard_files[shard_idx])
             self._loaded_shard_idx = shard_idx
@@ -203,7 +216,7 @@ class MaskedDataset(Dataset):
         return segment.long()
 
     def __len__(self):
-        return len(self.shard_indices)
+        return max(1, len(self.shard_indices))
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
@@ -237,18 +250,18 @@ class MaskedDataset(Dataset):
 
         return input_ids, target_ids, attention_mask, real_mask_p
 
-    def set_global_step(self, global_step):
-        self.global_step = global_step
-
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
         mask_p = self.args.mask_p_start + (self.args.mask_p_end - self.args.mask_p_start) * self.global_step / max(1, self.args.max_steps)
-        topk = max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item()))
+        topk = max(1, int(mask_ratios.numel() * mask_p + torch.rand(1).item()))
         mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
         mask = mask_ratios <= mask_threshold
         target_ids = torch.where(mask, input_ids, -100)
         input_ids = torch.where(mask, replacement_ids, input_ids)
         real_mask_p = mask.sum() / mask_ratios.numel()
         return input_ids, target_ids, real_mask_p
+
+    def set_global_step(self, global_step):
+        self.global_step = global_step
 
 
 MaskedDataset.show_random_item = show_random_item
@@ -258,8 +271,8 @@ MaskedDataset.show_random_item = show_random_item
 class CausalDataset(Dataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         self.seq_length = seq_length
-        self.n_special_tokens = args.n_special_tokens
         self.args = args
+        self.n_special_tokens = args.n_special_tokens
         self.global_step = 0
 
         self.cls_index = tokenizer.token_to_id("<s>")
@@ -268,20 +281,22 @@ class CausalDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
 
+        self._dummy_shard = [torch.full((seq_length,), self.pad_index, dtype=torch.long)]
+        if len(self.shard_indices) == 0:
+            self.shard_indices = [(0, 0, 0, seq_length)]
+            self.shard_files = ["__dummy__"]
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
-        self._dummy_shard = [torch.full((seq_length,), self.pad_index, dtype=torch.long)]
-
         self.counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
 
-        # Sanity check
         self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
         shard_idx, doc_idx, start, end = self.shard_indices[index]
         if self.shard_files[shard_idx] == "__dummy__":
-            return self._dummy_shard[doc_idx]
+            return self._dummy_shard[0]
         if self._loaded_shard_idx != shard_idx:
             self._loaded_shard = load_shard(self.shard_files[shard_idx])
             self._loaded_shard_idx = shard_idx
@@ -291,7 +306,7 @@ class CausalDataset(Dataset):
         return segment.long()
 
     def __len__(self):
-        return len(self.shard_indices)
+        return max(1, len(self.shard_indices))
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
@@ -310,7 +325,6 @@ class CausalDataset(Dataset):
             target_ids = torch.cat([target_ids, torch.LongTensor([-100] * padding_length)])
             attention_mask = torch.block_diag(attention_mask, torch.zeros(padding_length, padding_length, dtype=torch.bool))
 
-        attention_mask = attention_mask.tril()
         attention_mask = ~attention_mask
         input_ids = input_ids[:-1]
         target_ids = target_ids[1:]
@@ -329,6 +343,7 @@ CausalDataset.show_random_item = show_random_item
 class ValidationDataset(Dataset):
     def __init__(self, shard_dir, tokenizer, args, rank=None, world_size=None, seed=42):
         self.seq_length = args.seq_length
+        self.args = args
         self.n_special_tokens = args.n_special_tokens
 
         self.cls_index = tokenizer.token_to_id("<s>")
@@ -342,20 +357,21 @@ class ValidationDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{self.seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, self.seq_length, cache_file, rank, world_size)
 
+        self._dummy_shard = [torch.full((self.seq_length,), self.pad_index, dtype=torch.long)]
+        if len(self.shard_indices) == 0:
+            self.shard_indices = [(0, 0, 0, self.seq_length)]
+            self.shard_files = ["__dummy__"]
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
-        self._dummy_shard = [torch.full((self.seq_length,), self.pad_index, dtype=torch.long)]
 
         rng = random.Random(rank if rank is not None else seed)
         rng.shuffle(self.shard_indices)
 
-        # Sanity check
-        self.show_random_item(tokenizer)
-
     def _load_segment(self, index):
         shard_idx, doc_idx, start, end = self.shard_indices[index]
         if self.shard_files[shard_idx] == "__dummy__":
-            return self._dummy_shard[doc_idx]
+            return self._dummy_shard[0]
         if self._loaded_shard_idx != shard_idx:
             self._loaded_shard = load_shard(self.shard_files[shard_idx])
             self._loaded_shard_idx = shard_idx
@@ -365,12 +381,11 @@ class ValidationDataset(Dataset):
         return segment.long()
 
     def __len__(self):
-        return len(self.shard_indices)
+        return max(1, len(self.shard_indices))
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
         seq_length = min(self.seq_length - 2, tokens.size(0))
-
         segment = torch.cat([torch.LongTensor([self.cls_index]), tokens[:seq_length]])
         attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
 
@@ -392,9 +407,9 @@ class ValidationDataset(Dataset):
 
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
         mask_p = 0.15
-        topk = max(1, int(mask_ratios.size(0) * mask_p + 0.5))
+        topk = max(1, int(mask_ratios.numel() * mask_p + 0.5))
         mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
-        mask = mask_ratios < mask_threshold
+        mask = mask_ratios <= mask_threshold
         target_ids = torch.where(mask, input_ids, -100)
         input_ids = torch.where(mask, replacement_ids, input_ids)
         real_mask_p = mask.sum() / mask_ratios.numel()
@@ -403,7 +418,9 @@ class ValidationDataset(Dataset):
 
 ValidationDataset.show_random_item = show_random_item
 
+
 __all__ = ["MaskedDataset", "CausalDataset", "ValidationDataset"]
+
 
 
 
