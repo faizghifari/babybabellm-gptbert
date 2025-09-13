@@ -32,7 +32,7 @@ cd .. || exit 1
 
 # Preprocess
 echo "Preprocessing /data/MULTILINGUAL-SMALL..."
-python preprocessing/updated_preprocess.py \
+python preprocess/updated_preprocess.py \
     --dataset_type multilingual_small \
     --tokenizer tokenizers/tokenizer.json \
     --base_dir data \
