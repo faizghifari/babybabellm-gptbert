@@ -6,7 +6,7 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 
 # ===== Masking and helper classes =====
 class SpanMaskingStrategy:
@@ -208,7 +208,6 @@ class BaseDataset(Dataset):
         if self._loaded_shards[shard_idx] is not None:
             shard = self._loaded_shards[shard_idx]
         else:
-            # fallback lazy load
             if self._loaded_shard_idx != shard_idx:
                 shard = load_shard(self.shard_files[shard_idx])
                 self._loaded_shard = shard
@@ -224,7 +223,6 @@ class BaseDataset(Dataset):
         if doc.dim() == 0:
             doc = doc.unsqueeze(0)
 
-        # Handle tiny or empty segments gracefully
         if start >= doc.numel():
             return torch.tensor([], dtype=torch.long)
         segment = doc[start:end].long()
@@ -235,14 +233,14 @@ class BaseDataset(Dataset):
 class MaskedDataset(BaseDataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         super().__init__(shard_dir, seq_length, tokenizer, args, rank, world_size)
-
         self.n_special_tokens = args.n_special_tokens
+        self.vocab_size = args.vocab_size
         self.mask_index = tokenizer.token_to_id("<mask>")
         self.cls_index = tokenizer.token_to_id("<s>")
         self.pad_index = tokenizer.token_to_id("<pad>")
 
         self.masking_strategy = SpanMaskingStrategy(
-            args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index
+            self.n_special_tokens, args.mask_random_p, args.mask_keep_p, self.vocab_size, self.mask_index
         )
 
     def __len__(self):
@@ -250,35 +248,32 @@ class MaskedDataset(BaseDataset):
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
-
-        # Handle empty segments
         if tokens.numel() == 0:
             tokens = torch.tensor([self.cls_index], dtype=torch.long)
 
         seq_len = min(self.seq_length, tokens.numel())
-        tokens = tokens[:seq_len]
+        tokens = tokens[:seq_len].clamp(0, self.vocab_size - 1)
 
         if self.counts[index] is None:
             self.counts[index] = torch.zeros_like(tokens)
         if self.mask_counts[index] is None:
             self.mask_counts[index] = torch.zeros_like(tokens)
-
         self.counts[index][:seq_len] += 1
+
         mask_ratios, replacement_tokens = self.masking_strategy(tokens, self.mask_counts[index][:seq_len])
         input_ids, target_ids, real_mask_p = self.apply_mask(tokens, mask_ratios, replacement_tokens)
         self.mask_counts[index][:seq_len][target_ids != -100] += 1
 
-        # Add CLS token at beginning
         input_ids = torch.cat([torch.LongTensor([self.cls_index]), input_ids])
         target_ids = torch.cat([torch.LongTensor([-100]), target_ids])
-        attention_mask = torch.ones(seq_len + 1, seq_len + 1, dtype=torch.bool)
+        attention_mask = torch.ones(len(input_ids), len(input_ids), dtype=torch.bool)
 
-        # pad to seq_length
-        padding_length = self.seq_length - input_ids.numel()
+        padding_length = self.seq_length - len(input_ids)
         if padding_length > 0:
             input_ids = torch.cat([input_ids, torch.LongTensor([self.pad_index] * padding_length)])
             target_ids = torch.cat([target_ids, torch.LongTensor([-100] * padding_length)])
-            attention_mask = torch.block_diag(attention_mask, torch.zeros(padding_length, padding_length, dtype=torch.bool))
+            pad_mask = torch.zeros(padding_length, len(input_ids), dtype=torch.bool)
+            attention_mask = torch.block_diag(attention_mask, pad_mask)
 
         attention_mask = ~attention_mask
         input_ids = input_ids[:-1]
@@ -288,13 +283,12 @@ class MaskedDataset(BaseDataset):
         return input_ids, target_ids, attention_mask, real_mask_p
 
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
-        mask_p = self.args.mask_p_start + (self.args.mask_p_end - self.args.mask_p_start) * getattr(self, "global_step", 0) / max(1, self.args.max_steps)
-        topk = max(1, int(mask_ratios.numel() * mask_p + torch.rand(1).item()))
-        mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
+        mask_p = getattr(self, "global_step", 0)
+        mask_threshold = torch.topk(mask_ratios, max(1, int(len(mask_ratios) * mask_p))).values.max().item()
         mask = mask_ratios <= mask_threshold
         target_ids = torch.where(mask, input_ids, -100)
         input_ids = torch.where(mask, replacement_ids, input_ids)
-        real_mask_p = mask.sum() / mask_ratios.numel()
+        real_mask_p = mask.float().mean()
         return input_ids, target_ids, real_mask_p
 
 
@@ -303,6 +297,7 @@ class CausalDataset(BaseDataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         super().__init__(shard_dir, seq_length, tokenizer, args, rank, world_size)
         self.n_special_tokens = args.n_special_tokens
+        self.vocab_size = args.vocab_size
         self.cls_index = tokenizer.token_to_id("<s>")
         self.pad_index = tokenizer.token_to_id("<pad>")
 
@@ -311,25 +306,26 @@ class CausalDataset(BaseDataset):
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
-
-        # Handle empty segments
         if tokens.numel() == 0:
             tokens = torch.tensor([self.cls_index], dtype=torch.long)
 
         seq_len = min(self.seq_length, tokens.numel())
+        tokens = tokens[:seq_len].clamp(0, self.vocab_size - 1)
+
         if self.counts[index] is None:
             self.counts[index] = torch.zeros_like(tokens)
         self.counts[index][:seq_len] += 1
 
-        input_ids = torch.cat([torch.LongTensor([self.cls_index]), tokens[:seq_len]])
-        target_ids = torch.cat([torch.LongTensor([-100]), tokens[:seq_len]])
-        attention_mask = torch.ones(seq_len + 1, seq_len + 1, dtype=torch.bool)
+        input_ids = torch.cat([torch.LongTensor([self.cls_index]), tokens])
+        target_ids = torch.cat([torch.LongTensor([-100]), tokens])
+        attention_mask = torch.ones(len(input_ids), len(input_ids), dtype=torch.bool)
 
-        padding_length = self.seq_length - input_ids.numel()
+        padding_length = self.seq_length - len(input_ids)
         if padding_length > 0:
             input_ids = torch.cat([input_ids, torch.LongTensor([self.pad_index] * padding_length)])
             target_ids = torch.cat([target_ids, torch.LongTensor([-100] * padding_length)])
-            attention_mask = torch.block_diag(attention_mask, torch.zeros(padding_length, padding_length, dtype=torch.bool))
+            pad_mask = torch.zeros(padding_length, len(input_ids), dtype=torch.bool)
+            attention_mask = torch.block_diag(attention_mask, pad_mask)
 
         attention_mask = attention_mask.tril()
         attention_mask = ~attention_mask
@@ -340,7 +336,7 @@ class CausalDataset(BaseDataset):
         return input_ids, target_ids, attention_mask, torch.zeros([])
 
 
-# ===== ValidationDataset (kept simple) =====
+# ===== ValidationDataset =====
 class ValidationDataset(MaskedDataset):
     def __init__(self, shard_dir, tokenizer, args, rank=None, world_size=None, seed=42):
         super().__init__(shard_dir, tokenizer, args, args.seq_length, rank, world_size)
