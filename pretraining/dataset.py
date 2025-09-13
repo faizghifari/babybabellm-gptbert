@@ -1,5 +1,4 @@
 # coding=utf-8
-
 import os
 import pickle
 import random
@@ -157,8 +156,8 @@ def show_random_item(self, tokenizer):
     index = random.randint(0, len(self) - 1)
     input_ids, target_ids, attention_mask, real_mask_p = self[index]
     print("Random item sample:")
-    print("Input ids:", input_ids)
-    print("Target ids:", target_ids)
+    print("Input ids:", input_ids[:10])
+    print("Target ids:", target_ids[:10])
     print("Attention mask shape:", attention_mask.shape)
     print("Mask ratio:", real_mask_p)
 
@@ -396,6 +395,5 @@ class ValidationDataset(Dataset):
 ValidationDataset.show_random_item = show_random_item
 
 __all__ = ["MaskedDataset", "CausalDataset", "ValidationDataset"]
-
 
 
