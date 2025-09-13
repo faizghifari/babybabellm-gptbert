@@ -79,6 +79,7 @@ class RandomIndex:
 def load_shard(shard_file):
     if not os.path.exists(shard_file):
         raise FileNotFoundError(f"Shard file not found: {shard_file}")
+    # torch.load might return a list of tensors or lists
     return torch.load(shard_file, weights_only=False)
 
 
@@ -86,12 +87,14 @@ def _build_segment_index_for_shard(shard_file, seq_length):
     segments = []
     documents = load_shard(shard_file)
     for doc_idx, doc in enumerate(documents):
+        # make each document at least 1D tensor for consistent slicing
         if isinstance(doc, torch.Tensor) and doc.dim() == 0:
             doc = doc.unsqueeze(0)
         if not isinstance(doc, torch.Tensor):
             try:
                 doc = torch.tensor(doc, dtype=torch.long)
             except Exception:
+                # Skip documents we can't convert
                 continue
         doc_len = doc.numel()
         if doc_len == 0:
@@ -170,7 +173,7 @@ def show_random_item(self, tokenizer):
 # ===== Base Dataset with shard preloading =====
 class BaseDataset(Dataset):
     def __init__(self, shard_dir, seq_length, tokenizer, args, rank=None, world_size=None):
-        self.seq_length = seq_length
+        self.seq_length = int(seq_length)
         self.args = args
         self.rank = rank
         self.world_size = world_size
@@ -215,16 +218,21 @@ class BaseDataset(Dataset):
             else:
                 shard = self._loaded_shard
 
+        # Grab the document; ensure it's a 1D tensor we can slice
         doc = shard[doc_idx]
-
-        # Ensure doc is tensor and at least 1D
         if not isinstance(doc, torch.Tensor):
-            doc = torch.tensor(doc, dtype=torch.long)
+            try:
+                doc = torch.tensor(doc, dtype=torch.long)
+            except Exception:
+                # return empty tensor if doc not usable
+                return torch.tensor([], dtype=torch.long)
         if doc.dim() == 0:
             doc = doc.unsqueeze(0)
 
+        # If start beyond doc length, return empty to be handled by caller
         if start >= doc.numel():
             return torch.tensor([], dtype=torch.long)
+
         segment = doc[start:end].long()
         return segment
 
@@ -233,62 +241,105 @@ class BaseDataset(Dataset):
 class MaskedDataset(BaseDataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         super().__init__(shard_dir, seq_length, tokenizer, args, rank, world_size)
-        self.n_special_tokens = args.n_special_tokens
-        self.vocab_size = args.vocab_size
-        self.mask_index = tokenizer.token_to_id("<mask>")
-        self.cls_index = tokenizer.token_to_id("<s>")
-        self.pad_index = tokenizer.token_to_id("<pad>")
+        self.n_special_tokens = getattr(args, "n_special_tokens", 16)
+        self.vocab_size = int(getattr(args, "vocab_size", tokenizer.get_vocab_size() if hasattr(tokenizer, "get_vocab_size") else 32000))
+        # be defensive about token ids in tokenizer
+        self.mask_index = tokenizer.token_to_id("<mask>") if tokenizer.token_to_id("<mask>") is not None else min(self.vocab_size - 1, 3)
+        self.cls_index = tokenizer.token_to_id("<s>") if tokenizer.token_to_id("<s>") is not None else 1
+        self.pad_index = tokenizer.token_to_id("<pad>") if tokenizer.token_to_id("<pad>") is not None else 0
+
+        # ensure pad_index in vocab range
+        if not (0 <= self.pad_index < self.vocab_size):
+            self.pad_index = 0
 
         self.masking_strategy = SpanMaskingStrategy(
-            self.n_special_tokens, args.mask_random_p, args.mask_keep_p, self.vocab_size, self.mask_index
+            self.n_special_tokens, getattr(args, "mask_random_p", 0.1), getattr(args, "mask_keep_p", 0.1), self.vocab_size, self.mask_index
         )
+
+        # global step for dynamic mask p
+        self.global_step = 0
+
+    def set_global_step(self, step):
+        self.global_step = int(step)
 
     def __len__(self):
         return len(self.shard_indices)
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
+
+        # If empty, provide a minimal token sequence (CLS only)
         if tokens.numel() == 0:
             tokens = torch.tensor([self.cls_index], dtype=torch.long)
 
-        seq_len = min(self.seq_length, tokens.numel())
-        tokens = tokens[:seq_len].clamp(0, self.vocab_size - 1)
+        # clip tokens and clamp to vocab range
+        seq_available = min(self.seq_length - 1, tokens.numel())  # reserve 1 for CLS
+        tokens = tokens[:seq_available].clamp(0, self.vocab_size - 1)
 
+        # counts
         if self.counts[index] is None:
             self.counts[index] = torch.zeros_like(tokens)
         if self.mask_counts[index] is None:
             self.mask_counts[index] = torch.zeros_like(tokens)
-        self.counts[index][:seq_len] += 1
+        self.counts[index][:seq_available] += 1
 
-        mask_ratios, replacement_tokens = self.masking_strategy(tokens, self.mask_counts[index][:seq_len])
-        input_ids, target_ids, real_mask_p = self.apply_mask(tokens, mask_ratios, replacement_tokens)
-        self.mask_counts[index][:seq_len][target_ids != -100] += 1
+        # masking strategy -> input and target (pre CLS/pad)
+        mask_ratios, replacement_tokens = self.masking_strategy(tokens, self.mask_counts[index][:seq_available])
+        # compute dynamic mask probability from args if available
+        mask_p_start = getattr(self.args, "mask_p_start", 0.3)
+        mask_p_end = getattr(self.args, "mask_p_end", 0.15)
+        max_steps = max(1, int(getattr(self.args, "max_steps", 1)))
+        mask_p = mask_p_start + (mask_p_end - mask_p_start) * (self.global_step / max_steps)
+        topk = max(1, int(mask_ratios.numel() * mask_p + torch.rand(1).item()))
+        mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
+        mask = mask_ratios <= mask_threshold
+        target_ids_core = torch.where(mask, tokens, torch.tensor(-100, dtype=torch.long))
+        input_ids_core = torch.where(mask, replacement_tokens, tokens)
+        real_mask_p = float(mask.sum().item()) / max(1, mask.numel())
 
-        input_ids = torch.cat([torch.LongTensor([self.cls_index]), input_ids])
-        target_ids = torch.cat([torch.LongTensor([-100]), target_ids])
-        attention_mask = torch.ones(len(input_ids), len(input_ids), dtype=torch.bool)
+        # update mask counts: only positions where target_ids != -100 are masked
+        self.mask_counts[index][:seq_available][target_ids_core != -100] += 1
 
-        padding_length = self.seq_length - len(input_ids)
-        if padding_length > 0:
-            input_ids = torch.cat([input_ids, torch.LongTensor([self.pad_index] * padding_length)])
-            target_ids = torch.cat([target_ids, torch.LongTensor([-100] * padding_length)])
-            pad_mask = torch.zeros(padding_length, len(input_ids), dtype=torch.bool)
-            attention_mask = torch.block_diag(attention_mask, pad_mask)
+        # Build full-length sequences (CLS + core + PAD to seq_length)
+        input_ids_full = torch.cat([torch.tensor([self.cls_index], dtype=torch.long), input_ids_core], dim=0)
+        target_ids_full = torch.cat([torch.tensor([-100], dtype=torch.long), target_ids_core], dim=0)
 
-        attention_mask = ~attention_mask
-        input_ids = input_ids[:-1]
-        target_ids = target_ids[1:]
-        attention_mask = attention_mask[:-1, :-1]
+        # pad to seq_length
+        pad_len = self.seq_length - input_ids_full.numel()
+        if pad_len > 0:
+            input_ids_full = torch.cat([input_ids_full, torch.full((pad_len,), self.pad_index, dtype=torch.long)], dim=0)
+            target_ids_full = torch.cat([target_ids_full, torch.full((pad_len,), -100, dtype=torch.long)], dim=0)
+        else:
+            # already of length seq_length (or greater, but we ensured seq_available <= seq_length-1)
+            input_ids_full = input_ids_full[: self.seq_length]
+            target_ids_full = target_ids_full[: self.seq_length]
 
-        return input_ids, target_ids, attention_mask, real_mask_p
+        # ensure input_ids are within vocab range
+        input_ids_full = input_ids_full.clamp(0, self.vocab_size - 1)
 
+        # Build attention mask: for masked objective we allow full attention among valid tokens.
+        # We'll create a square seq_length x seq_length mask where True = positions that should be masked
+        valid_len = (input_ids_full != self.pad_index).sum().item()
+        # start with zero matrix
+        att = torch.zeros((self.seq_length, self.seq_length), dtype=torch.bool)
+        if valid_len > 0:
+            att[:valid_len, :valid_len] = 1  # valid region (full attention)
+        # convert to mask where True means "mask out"; model code expects inverted tril/full
+        # For MLM, we don't want to mask positions in attention, so set mask_out = ~att
+        mask_out = ~att
+
+        return input_ids_full, target_ids_full, mask_out, torch.tensor(real_mask_p, dtype=torch.float)
+
+    # keep original apply_mask API (not used externally now)
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
+        # fallback not used since logic is in __getitem__
         mask_p = getattr(self, "global_step", 0)
-        mask_threshold = torch.topk(mask_ratios, max(1, int(len(mask_ratios) * mask_p))).values.max().item()
+        topk = max(1, int(mask_ratios.numel() * mask_p + torch.rand(1).item()))
+        mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
         mask = mask_ratios <= mask_threshold
         target_ids = torch.where(mask, input_ids, -100)
         input_ids = torch.where(mask, replacement_ids, input_ids)
-        real_mask_p = mask.float().mean()
+        real_mask_p = mask.float().mean().item() if mask.numel() > 0 else 0.0
         return input_ids, target_ids, real_mask_p
 
 
@@ -296,44 +347,59 @@ class MaskedDataset(BaseDataset):
 class CausalDataset(BaseDataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         super().__init__(shard_dir, seq_length, tokenizer, args, rank, world_size)
-        self.n_special_tokens = args.n_special_tokens
-        self.vocab_size = args.vocab_size
-        self.cls_index = tokenizer.token_to_id("<s>")
-        self.pad_index = tokenizer.token_to_id("<pad>")
+        self.n_special_tokens = getattr(args, "n_special_tokens", 16)
+        self.vocab_size = int(getattr(args, "vocab_size", tokenizer.get_vocab_size() if hasattr(tokenizer, "get_vocab_size") else 32000))
+        self.cls_index = tokenizer.token_to_id("<s>") if tokenizer.token_to_id("<s>") is not None else 1
+        self.pad_index = tokenizer.token_to_id("<pad>") if tokenizer.token_to_id("<pad>") is not None else 0
+
+        if not (0 <= self.pad_index < self.vocab_size):
+            self.pad_index = 0
 
     def __len__(self):
         return len(self.shard_indices)
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
-        if tokens.numel() == 0:
-            tokens = torch.tensor([self.cls_index], dtype=torch.long)
 
-        seq_len = min(self.seq_length, tokens.numel())
-        tokens = tokens[:seq_len].clamp(0, self.vocab_size - 1)
+        if tokens.numel() == 0:
+            tokens = torch.tensor([], dtype=torch.long)
+
+        # For causal we reserve 1 slot for CLS, then token sequence up to seq_length-1
+        seq_available = min(self.seq_length - 1, tokens.numel())
+        tokens = tokens[:seq_available].clamp(0, self.vocab_size - 1)
 
         if self.counts[index] is None:
             self.counts[index] = torch.zeros_like(tokens)
-        self.counts[index][:seq_len] += 1
+        if tokens.numel() > 0:
+            self.counts[index][: tokens.numel()] += 1
 
-        input_ids = torch.cat([torch.LongTensor([self.cls_index]), tokens])
-        target_ids = torch.cat([torch.LongTensor([-100]), tokens])
-        attention_mask = torch.ones(len(input_ids), len(input_ids), dtype=torch.bool)
+        # Build input and target (shifted)
+        # input_ids_full length = seq_length after padding
+        input_ids_full = torch.cat([torch.tensor([self.cls_index], dtype=torch.long), tokens], dim=0)
+        target_ids_full = torch.cat([tokens, torch.tensor([-100], dtype=torch.long)], dim=0)
 
-        padding_length = self.seq_length - len(input_ids)
-        if padding_length > 0:
-            input_ids = torch.cat([input_ids, torch.LongTensor([self.pad_index] * padding_length)])
-            target_ids = torch.cat([target_ids, torch.LongTensor([-100] * padding_length)])
-            pad_mask = torch.zeros(padding_length, len(input_ids), dtype=torch.bool)
-            attention_mask = torch.block_diag(attention_mask, pad_mask)
+        # pad to seq_length
+        pad_len = self.seq_length - input_ids_full.numel()
+        if pad_len > 0:
+            input_ids_full = torch.cat([input_ids_full, torch.full((pad_len,), self.pad_index, dtype=torch.long)], dim=0)
+            target_ids_full = torch.cat([target_ids_full, torch.full((pad_len,), -100, dtype=torch.long)], dim=0)
+        else:
+            input_ids_full = input_ids_full[: self.seq_length]
+            target_ids_full = target_ids_full[: self.seq_length]
 
-        attention_mask = attention_mask.tril()
-        attention_mask = ~attention_mask
-        input_ids = input_ids[:-1]
-        target_ids = target_ids[1:]
-        attention_mask = attention_mask[:-1, :-1]
+        # ensure IDs within vocab
+        input_ids_full = input_ids_full.clamp(0, self.vocab_size - 1)
 
-        return input_ids, target_ids, attention_mask, torch.zeros([])
+        # Build attention mask (causal lower-triangular on valid prefix).
+        valid_len = (input_ids_full != self.pad_index).sum().item()
+        att = torch.zeros((self.seq_length, self.seq_length), dtype=torch.bool)
+        if valid_len > 0:
+            # allow causal attention among valid tokens
+            att[:valid_len, :valid_len] = torch.tril(torch.ones((valid_len, valid_len), dtype=torch.bool))
+        # model expects mask where True = positions to mask out -> invert
+        mask_out = ~att
+
+        return input_ids_full, target_ids_full, mask_out, torch.tensor(0.0, dtype=torch.float)
 
 
 # ===== ValidationDataset =====
@@ -350,5 +416,6 @@ CausalDataset.show_random_item = show_random_item
 ValidationDataset.show_random_item = show_random_item
 
 __all__ = ["MaskedDataset", "CausalDataset", "ValidationDataset"]
+
 
 
