@@ -24,8 +24,13 @@ pip install "torch>=2.0.0" tqdm numpy tokenizers wandb datasets transformers "pr
 
 # Preprocess
 echo "Preprocessing /data/MULTILINGUAL-SMALL..."
-python /scripts/encode_dataset.py --train_path /data/MULTILINGUAL-SMALL/train \
-                                   --valid_path /data/MULTILINGUAL-SMALL/valid
+python /scripts/updated_preprocess.py \
+    --dataset_type multilingual_small \
+    --tokenizer /tokenizers/tokenizer.json \
+    --base_dir /data \
+    --seq_length 128 \
+    --shard_size_bytes 100000000 \
+    --batch_size 1000
 echo "Preprocessing finished."
 
 # Training
