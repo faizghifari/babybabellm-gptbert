@@ -12,19 +12,21 @@ I modify the pretraining code provided by Charpentier et al (2024)
 
 ```
 python3 -m venv venvs/demo; source venvs/demo/bin/activate
-pip3 install -r requirements.txt
+hf auth login
 ```
+
 ## Training
 
 There are three default modes for training: monolingual GPT-BERT trained on one BabyBabelLM corpus, a small multilingual model (trained on Tier 1 multilingual corpora) and one large multilingual model.  
 
+### Monolingual GPT-BERTs
 ```
 cd scripts
 sbatch run_mono.slurm zho
 sbatch run_mono.slurm nld
 sbatch run_mono.slurm deu
 ```
-
+# Multilingual GPT-BERTs
 ```
 cd scripts
 sbatch run_multiall.slurm
