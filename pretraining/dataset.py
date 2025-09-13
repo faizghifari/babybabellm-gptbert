@@ -76,6 +76,8 @@ class RandomIndex:
 
 # ===== Shard loader & index builder =====
 def load_shard(shard_file):
+    if not os.path.exists(shard_file):
+        raise FileNotFoundError(f"Shard file not found: {shard_file}")
     return torch.load(shard_file, weights_only=False)
 
 
@@ -109,7 +111,8 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
         try:
             with open(cache_file, "rb") as f:
                 data = pickle.load(f)
-            return data["shard_indices"], data["shard_files"]
+            shard_files = [os.path.join(shard_dir, os.path.basename(f)) for f in data["shard_files"]]
+            return data["shard_indices"], shard_files
         except Exception:
             print(f"Warning: failed to load cache {cache_file}, rebuilding indices")
 
@@ -127,15 +130,13 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
             print(f"Warning: failed processing shard {shard_file}: {e}")
             continue
 
-    # ---------- Dummy shard if empty ----------
     if len(shard_indices) == 0:
         print(f"Warning: no segments found in {shard_dir}. Adding dummy shard and segment.")
         if len(shard_files) == 0:
             dummy_file = os.path.join(shard_dir, "dummy.bin")
             torch.save(torch.tensor([0], dtype=torch.long), dummy_file)
             shard_files.append(dummy_file)
-        shard_indices.append((0, 0, 0, 1))  # guaranteed 4-tuple
-    # ----------------------------------------
+        shard_indices.append((0, 0, 0, 1))
 
     try:
         tmp_cache = cache_file + ".tmp"
@@ -153,13 +154,16 @@ def show_random_item(self, tokenizer):
     if len(self) == 0:
         print("Dataset empty: no item to show.")
         return
-    index = random.randint(0, len(self) - 1)
-    input_ids, target_ids, attention_mask, real_mask_p = self[index]
-    print("Random item sample:")
-    print("Input ids:", input_ids[:10])
-    print("Target ids:", target_ids[:10])
-    print("Attention mask shape:", attention_mask.shape)
-    print("Mask ratio:", real_mask_p)
+    try:
+        index = random.randint(0, len(self) - 1)
+        input_ids, target_ids, attention_mask, real_mask_p = self[index]
+        print("Random item sample:")
+        print("Input ids:", input_ids[:10])
+        print("Target ids:", target_ids[:10])
+        print("Attention mask shape:", attention_mask.shape)
+        print("Mask ratio:", real_mask_p)
+    except Exception as e:
+        print(f"Failed to show random item: {e}")
 
 
 # ===== MaskedDataset =====
@@ -181,13 +185,16 @@ class MaskedDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
 
+        missing = [f for f in self.shard_files if not os.path.exists(f)]
+        if missing:
+            raise FileNotFoundError(f"Missing shard files: {missing}")
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
         self.counts = [None] * len(self.shard_indices)
         self.mask_counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
 
-        # Sanity check
         self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
@@ -249,9 +256,6 @@ class MaskedDataset(Dataset):
         return input_ids, target_ids, real_mask_p
 
 
-MaskedDataset.show_random_item = show_random_item
-
-
 # ===== CausalDataset =====
 class CausalDataset(Dataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
@@ -266,12 +270,15 @@ class CausalDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
 
+        missing = [f for f in self.shard_files if not os.path.exists(f)]
+        if missing:
+            raise FileNotFoundError(f"Missing shard files: {missing}")
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
         self.counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
 
-        # Sanity check
         self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
@@ -316,9 +323,6 @@ class CausalDataset(Dataset):
         self.global_step = global_step
 
 
-CausalDataset.show_random_item = show_random_item
-
-
 # ===== ValidationDataset =====
 class ValidationDataset(Dataset):
     def __init__(self, shard_dir, tokenizer, args, rank=None, world_size=None, seed=42):
@@ -327,7 +331,6 @@ class ValidationDataset(Dataset):
 
         self.cls_index = tokenizer.token_to_id("<s>")
         self.pad_index = tokenizer.token_to_id("<pad>")
-
         self.mask_index = tokenizer.token_to_id("<mask>")
         self.masking_strategy = SpanMaskingStrategy(
             args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index
@@ -336,13 +339,16 @@ class ValidationDataset(Dataset):
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{self.seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, self.seq_length, cache_file, rank, world_size)
 
+        missing = [f for f in self.shard_files if not os.path.exists(f)]
+        if missing:
+            raise FileNotFoundError(f"Missing shard files: {missing}")
+
         self._loaded_shard = None
         self._loaded_shard_idx = None
 
         rng = random.Random(rank if rank is not None else seed)
         rng.shuffle(self.shard_indices)
 
-        # Sanity check
         self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
@@ -392,6 +398,8 @@ class ValidationDataset(Dataset):
         return input_ids, target_ids, real_mask_p
 
 
+MaskedDataset.show_random_item = show_random_item
+CausalDataset.show_random_item = show_random_item
 ValidationDataset.show_random_item = show_random_item
 
 __all__ = ["MaskedDataset", "CausalDataset", "ValidationDataset"]
