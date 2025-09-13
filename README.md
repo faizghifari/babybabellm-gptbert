@@ -14,6 +14,29 @@ I modify the pretraining code provided by Charpentier et al (2024)
 python3 -m venv venvs/demo; source venvs/demo/bin/activate
 pip3 install -r requirements.txt
 ```
+## Training
+
+There are three default modes for training: monolingual GPT-BERT trained on one BabyBabelLM corpus, a small multilingual model (trained on Tier 1 multilingual corpora) and one large multilingual model.  
+
+```
+cd scripts
+sbatch run_mono.slurm zho
+sbatch run_mono.slurm nld
+sbatch run_mono.slurm deu
+```
+
+```
+cd scripts
+sbatch run_multisall.slurm
+```
+
+
+```
+cd scripts
+sbatch run_multismall.slurm
+```
+
+## Information
 
 ## Multilingual Datasets and Tokenizers
 
@@ -21,7 +44,6 @@ pip3 install -r requirements.txt
 cd tokenizers
 python3 tokenizer.py
 ```
-
 
 ## BabyLM Tokenization & Sharding Pipeline
 
