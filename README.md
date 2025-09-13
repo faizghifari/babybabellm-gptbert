@@ -27,7 +27,7 @@ sbatch run_mono.slurm deu
 
 ```
 cd scripts
-sbatch run_multisall.slurm
+sbatch run_multiall.slurm
 ```
 
 
