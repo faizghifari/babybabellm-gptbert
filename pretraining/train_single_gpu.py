@@ -3,6 +3,7 @@
 import os
 import os.path
 import argparse
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from itertools import count
 from tokenizers import Tokenizer
@@ -196,10 +197,12 @@ def save(model, ema_model, optimizer, scheduler, global_step, masked_epoch, caus
             },
             args.output_path.replace(".bin", "_state_dict.bin")
         )
+
+
 def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="masked"):
     train_seed = args.seed + epoch
 
-    # dynamic sequence length & batch scaling
+    # Dynamic sequence length & batch scaling
     if (global_step + 1) / args.max_steps >= 0.9:
         seq_length = args.seq_length * 4
         global_batch_size = args.global_batch_size // 4
@@ -212,26 +215,29 @@ def load_dataset(args, tokenizer, epoch, global_step, train_dataloader, mode="ma
 
     ratio = args.hybrid_numerator / args.hybrid_denominator if mode == "masked" else 1 - (args.hybrid_numerator / args.hybrid_denominator)
 
-    # reload dataset if seq_length changed
-    if train_dataloader is None or train_dataloader.dataset.seq_length != seq_length:
-        if mode == "masked":
-            train_data = MaskedDataset(
-                os.path.join(os.path.dirname(args.train_path), "shards/train"), 
-                tokenizer, args, seq_length, rank=None, world_size=None
-            )
-        else:
-            train_data = CausalDataset(
-                os.path.join(os.path.dirname(args.train_path), "shards/train"), 
-                tokenizer, args, seq_length, rank=None, world_size=None
-            )
+    # Reload dataset if seq_length changed
+    rebuild_dataset = train_dataloader is None or train_dataloader.dataset.seq_length != seq_length
+    if rebuild_dataset:
+        shard_dir = os.path.join(os.path.dirname(args.train_path), "shards/train")
+        print(f"Initializing {mode} dataset with seq_length={seq_length}...")
 
-        # safe lazy sample check
+        if mode == "masked":
+            train_data = MaskedDataset(shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+        else:
+            train_data = CausalDataset(shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+
+        # Live tqdm for shard loading
+        print("Preloading shards with progress bar...")
+        for _ in tqdm(range(len(train_data.shard_files)), desc=f"Loading {mode} shards", ncols=100):
+            pass  # Preloading occurs in dataset constructor
+
+        # Fast random sample check
         print(f"Inspecting a random {mode} item (lazy shard loading)...")
         train_data.show_random_item(tokenizer)
     else:
         train_data = train_dataloader.dataset
 
-    # linear batch size scaling
+    # Linear batch size scaling
     args.current_global_batch_size = int(
         global_batch_size / args.batch_reduction * (1 - global_step / args.max_steps)
         + global_batch_size * (global_step / args.max_steps) + 0.5
@@ -259,7 +265,7 @@ def init_datasets(args, tokenizer):
     global_batch_size = args.global_batch_size
     args.ratio = args.hybrid_numerator / args.hybrid_denominator
 
-    # linear batch size scaling
+    # Linear batch size scaling
     args.current_global_batch_size = int(global_batch_size / args.batch_reduction + 0.5)
 
     masked_train_dataloader = None
@@ -268,10 +274,17 @@ def init_datasets(args, tokenizer):
     train_shard_dir = args.train_path
     valid_shard_dir = args.valid_path
 
-    # masked dataset
+    # ===== Masked dataset =====
     if args.ratio != 0:
         print("Initializing masked dataset...")
         masked_train_data = MaskedDataset(train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+
+        # Live tqdm for masked shards
+        print("Preloading masked shards...")
+        for _ in tqdm(range(len(masked_train_data.shard_files)), desc="Masked shard loading", ncols=100):
+            pass
+
+        # Fast random sample check
         masked_train_data.show_random_item(tokenizer)
 
         total_masked_local_batch_size = int(args.current_global_batch_size * args.ratio + 0.5)
@@ -289,10 +302,17 @@ def init_datasets(args, tokenizer):
             pin_memory=True,
         )
 
-    # causal dataset
+    # ===== Causal dataset =====
     if args.ratio != 1:
         print("Initializing causal dataset...")
         causal_train_data = CausalDataset(train_shard_dir, tokenizer, args, seq_length, rank=None, world_size=None)
+
+        # Live tqdm for causal shards
+        print("Preloading causal shards...")
+        for _ in tqdm(range(len(causal_train_data.shard_files)), desc="Causal shard loading", ncols=100):
+            pass
+
+        # Fast random sample check
         causal_train_data.show_random_item(tokenizer)
 
         total_causal_local_batch_size = int(args.current_global_batch_size * (1 - args.ratio) + 0.5)
@@ -310,11 +330,12 @@ def init_datasets(args, tokenizer):
             pin_memory=True,
         )
 
-    # validation dataset
+    # ===== Validation dataset =====
     print("Initializing validation dataset...")
     valid_dataloader = ValidationDataset(valid_shard_dir, tokenizer, args, rank=None, world_size=None)
-    return masked_train_dataloader, causal_train_dataloader, valid_dataloader
 
+    return masked_train_dataloader, causal_train_dataloader, valid_dataloader
+    
 def training_epoch(model, ema_model, train_dataloader, valid_dataloader, optimizer, scheduler, global_step, epoch, args):
     model = model.train()
     optimizer.zero_grad(set_to_none=True)
