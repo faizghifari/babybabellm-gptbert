@@ -3,9 +3,10 @@ import os
 import pickle
 import random
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 
 # ===== Masking and helper classes =====
 class SpanMaskingStrategy:
@@ -166,14 +167,65 @@ def show_random_item(self, tokenizer):
         print(f"Failed to show random item: {e}")
 
 
-# ===== MaskedDataset =====
-class MaskedDataset(Dataset):
-    def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
+# ===== Base Dataset with shard preloading =====
+class BaseDataset(Dataset):
+    def __init__(self, shard_dir, seq_length, tokenizer, args, rank=None, world_size=None):
         self.seq_length = seq_length
-        self.n_special_tokens = args.n_special_tokens
         self.args = args
-        self.global_step = 0
+        self.rank = rank
+        self.world_size = world_size
 
+        cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
+        self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
+
+        self._loaded_shard = None
+        self._loaded_shard_idx = None
+        self._loaded_shards = [None] * len(self.shard_files)
+        self.counts = [None] * len(self.shard_indices)
+        self.mask_counts = [None] * len(self.shard_indices)
+        self.random_index = RandomIndex(len(self.shard_indices))
+
+        # Try preloading all shards asynchronously
+        self._preload_shards_async()
+
+    def _preload_shards_async(self, max_workers=4):
+        """Load all shards in parallel using threads with tqdm progress."""
+        def load_shard_safe(idx):
+            try:
+                self._loaded_shards[idx] = load_shard(self.shard_files[idx])
+            except Exception as e:
+                print(f"Failed to load shard {self.shard_files[idx]}: {e}")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            list(tqdm(executor.map(load_shard_safe, range(len(self.shard_files))),
+                      total=len(self.shard_files),
+                      desc="Preloading shards"))
+
+    def _load_segment(self, index):
+        shard_idx, doc_idx, start, end = self.shard_indices[index]
+        shard = None
+        # Use preloaded shard if available
+        if self._loaded_shards[shard_idx] is not None:
+            shard = self._loaded_shards[shard_idx]
+        else:  # fallback lazy load
+            if self._loaded_shard_idx != shard_idx:
+                shard = load_shard(self.shard_files[shard_idx])
+                self._loaded_shard = shard
+                self._loaded_shard_idx = shard_idx
+            else:
+                shard = self._loaded_shard
+        segment = shard[doc_idx][start:end]
+        if isinstance(segment, torch.Tensor) and segment.dim() == 0:
+            segment = segment.unsqueeze(0)
+        return segment.long()
+
+
+# ===== MaskedDataset =====
+class MaskedDataset(BaseDataset):
+    def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
+        super().__init__(shard_dir, seq_length, tokenizer, args, rank, world_size)
+
+        self.n_special_tokens = args.n_special_tokens
         self.mask_index = tokenizer.token_to_id("<mask>")
         self.cls_index = tokenizer.token_to_id("<s>")
         self.pad_index = tokenizer.token_to_id("<pad>")
@@ -181,31 +233,6 @@ class MaskedDataset(Dataset):
         self.masking_strategy = SpanMaskingStrategy(
             args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index
         )
-
-        cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
-        self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
-
-        missing = [f for f in self.shard_files if not os.path.exists(f)]
-        if missing:
-            raise FileNotFoundError(f"Missing shard files: {missing}")
-
-        self._loaded_shard = None
-        self._loaded_shard_idx = None
-        self.counts = [None] * len(self.shard_indices)
-        self.mask_counts = [None] * len(self.shard_indices)
-        self.random_index = RandomIndex(len(self.shard_indices))
-
-        self.show_random_item(tokenizer)
-
-    def _load_segment(self, index):
-        shard_idx, doc_idx, start, end = self.shard_indices[index]
-        if self._loaded_shard_idx != shard_idx:
-            self._loaded_shard = load_shard(self.shard_files[shard_idx])
-            self._loaded_shard_idx = shard_idx
-        segment = self._loaded_shard[doc_idx][start:end]
-        if isinstance(segment, torch.Tensor) and segment.dim() == 0:
-            segment = segment.unsqueeze(0)
-        return segment.long()
 
     def __len__(self):
         return len(self.shard_indices)
@@ -225,10 +252,12 @@ class MaskedDataset(Dataset):
         input_ids, target_ids, real_mask_p = self.apply_mask(tokens, mask_ratios, replacement_tokens)
         self.mask_counts[index][:seq_len][target_ids != -100] += 1
 
+        # Add CLS token at beginning
         input_ids = torch.cat([torch.LongTensor([self.cls_index]), input_ids])
         target_ids = torch.cat([torch.LongTensor([-100]), target_ids])
         attention_mask = torch.ones(seq_len + 1, seq_len + 1, dtype=torch.bool)
 
+        # pad to seq_length
         padding_length = self.seq_length - input_ids.numel()
         if padding_length > 0:
             input_ids = torch.cat([input_ids, torch.LongTensor([self.pad_index] * padding_length)])
@@ -242,11 +271,8 @@ class MaskedDataset(Dataset):
 
         return input_ids, target_ids, attention_mask, real_mask_p
 
-    def set_global_step(self, global_step):
-        self.global_step = global_step
-
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
-        mask_p = self.args.mask_p_start + (self.args.mask_p_end - self.args.mask_p_start) * self.global_step / max(1, self.args.max_steps)
+        mask_p = self.args.mask_p_start + (self.args.mask_p_end - self.args.mask_p_start) * getattr(self, "global_step", 0) / max(1, self.args.max_steps)
         topk = max(1, int(mask_ratios.numel() * mask_p + torch.rand(1).item()))
         mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
         mask = mask_ratios <= mask_threshold
@@ -257,39 +283,12 @@ class MaskedDataset(Dataset):
 
 
 # ===== CausalDataset =====
-class CausalDataset(Dataset):
+class CausalDataset(BaseDataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
-        self.seq_length = seq_length
-        self.args = args
+        super().__init__(shard_dir, seq_length, tokenizer, args, rank, world_size)
         self.n_special_tokens = args.n_special_tokens
-        self.global_step = 0
-
         self.cls_index = tokenizer.token_to_id("<s>")
         self.pad_index = tokenizer.token_to_id("<pad>")
-
-        cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
-        self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
-
-        missing = [f for f in self.shard_files if not os.path.exists(f)]
-        if missing:
-            raise FileNotFoundError(f"Missing shard files: {missing}")
-
-        self._loaded_shard = None
-        self._loaded_shard_idx = None
-        self.counts = [None] * len(self.shard_indices)
-        self.random_index = RandomIndex(len(self.shard_indices))
-
-        self.show_random_item(tokenizer)
-
-    def _load_segment(self, index):
-        shard_idx, doc_idx, start, end = self.shard_indices[index]
-        if self._loaded_shard_idx != shard_idx:
-            self._loaded_shard = load_shard(self.shard_files[shard_idx])
-            self._loaded_shard_idx = shard_idx
-        segment = self._loaded_shard[doc_idx][start:end]
-        if isinstance(segment, torch.Tensor) and segment.dim() == 0:
-            segment = segment.unsqueeze(0)
-        return segment.long()
 
     def __len__(self):
         return len(self.shard_indices)
@@ -319,85 +318,16 @@ class CausalDataset(Dataset):
 
         return input_ids, target_ids, attention_mask, torch.zeros([])
 
-    def set_global_step(self, global_step):
-        self.global_step = global_step
 
-
-# ===== ValidationDataset =====
-class ValidationDataset(Dataset):
+# ===== ValidationDataset (kept simple) =====
+class ValidationDataset(MaskedDataset):
     def __init__(self, shard_dir, tokenizer, args, rank=None, world_size=None, seed=42):
-        self.seq_length = args.seq_length
-        self.n_special_tokens = args.n_special_tokens
-
-        self.cls_index = tokenizer.token_to_id("<s>")
-        self.pad_index = tokenizer.token_to_id("<pad>")
-        self.mask_index = tokenizer.token_to_id("<mask>")
-        self.masking_strategy = SpanMaskingStrategy(
-            args.n_special_tokens, args.mask_random_p, args.mask_keep_p, args.vocab_size, self.mask_index
-        )
-
-        cache_file = os.path.join(shard_dir, f"shard_indices_seq{self.seq_length}.pkl")
-        self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, self.seq_length, cache_file, rank, world_size)
-
-        missing = [f for f in self.shard_files if not os.path.exists(f)]
-        if missing:
-            raise FileNotFoundError(f"Missing shard files: {missing}")
-
-        self._loaded_shard = None
-        self._loaded_shard_idx = None
-
+        super().__init__(shard_dir, tokenizer, args, args.seq_length, rank, world_size)
         rng = random.Random(rank if rank is not None else seed)
         rng.shuffle(self.shard_indices)
 
-        self.show_random_item(tokenizer)
 
-    def _load_segment(self, index):
-        shard_idx, doc_idx, start, end = self.shard_indices[index]
-        if self._loaded_shard_idx != shard_idx:
-            self._loaded_shard = load_shard(self.shard_files[shard_idx])
-            self._loaded_shard_idx = shard_idx
-        segment = self._loaded_shard[doc_idx][start:end]
-        if isinstance(segment, torch.Tensor) and segment.dim() == 0:
-            segment = segment.unsqueeze(0)
-        return segment.long()
-
-    def __len__(self):
-        return len(self.shard_indices)
-
-    def __getitem__(self, index):
-        tokens = self._load_segment(index)
-        seq_length = min(self.seq_length - 2, tokens.numel())
-
-        segment = torch.cat([torch.LongTensor([self.cls_index]), tokens[:seq_length]])
-        attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
-
-        mask_ratios, replacement_tokens = self.masking_strategy(segment)
-        input_ids, target_ids, real_mask_p = self.apply_mask(segment, mask_ratios, replacement_tokens)
-
-        padding_length = self.seq_length - segment.numel() + 1
-        if padding_length > 0:
-            input_ids = torch.cat([input_ids, torch.LongTensor([self.pad_index] * padding_length)])
-            target_ids = torch.cat([target_ids, torch.LongTensor([-100] * padding_length)])
-            attention_mask = torch.block_diag(attention_mask, torch.zeros(padding_length, padding_length, dtype=torch.bool))
-
-        attention_mask = ~attention_mask
-        input_ids = input_ids[:-1]
-        target_ids = target_ids[1:]
-        attention_mask = attention_mask[:-1, :-1]
-
-        return input_ids, target_ids, attention_mask, real_mask_p
-
-    def apply_mask(self, input_ids, mask_ratios, replacement_ids):
-        mask_p = 0.15
-        topk = max(1, int(mask_ratios.numel() * mask_p + 0.5))
-        mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
-        mask = mask_ratios < mask_threshold
-        target_ids = torch.where(mask, input_ids, -100)
-        input_ids = torch.where(mask, replacement_ids, input_ids)
-        real_mask_p = mask.sum() / mask_ratios.numel()
-        return input_ids, target_ids, real_mask_p
-
-
+# ===== Attach helper =====
 MaskedDataset.show_random_item = show_random_item
 CausalDataset.show_random_item = show_random_item
 ValidationDataset.show_random_item = show_random_item
