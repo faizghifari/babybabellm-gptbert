@@ -203,21 +203,32 @@ class BaseDataset(Dataset):
 
     def _load_segment(self, index):
         shard_idx, doc_idx, start, end = self.shard_indices[index]
-        shard = None
+
         # Use preloaded shard if available
         if self._loaded_shards[shard_idx] is not None:
             shard = self._loaded_shards[shard_idx]
-        else:  # fallback lazy load
+        else:
+            # fallback lazy load
             if self._loaded_shard_idx != shard_idx:
                 shard = load_shard(self.shard_files[shard_idx])
                 self._loaded_shard = shard
                 self._loaded_shard_idx = shard_idx
             else:
                 shard = self._loaded_shard
-        segment = shard[doc_idx][start:end]
-        if isinstance(segment, torch.Tensor) and segment.dim() == 0:
-            segment = segment.unsqueeze(0)
-        return segment.long()
+
+        doc = shard[doc_idx]
+
+        # Ensure doc is tensor and at least 1D
+        if not isinstance(doc, torch.Tensor):
+            doc = torch.tensor(doc, dtype=torch.long)
+        if doc.dim() == 0:
+            doc = doc.unsqueeze(0)
+
+        # Handle tiny or empty segments gracefully
+        if start >= doc.numel():
+            return torch.tensor([], dtype=torch.long)
+        segment = doc[start:end].long()
+        return segment
 
 
 # ===== MaskedDataset =====
@@ -239,6 +250,11 @@ class MaskedDataset(BaseDataset):
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
+
+        # Handle empty segments
+        if tokens.numel() == 0:
+            tokens = torch.tensor([self.cls_index], dtype=torch.long)
+
         seq_len = min(self.seq_length, tokens.numel())
         tokens = tokens[:seq_len]
 
@@ -295,6 +311,11 @@ class CausalDataset(BaseDataset):
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
+
+        # Handle empty segments
+        if tokens.numel() == 0:
+            tokens = torch.tensor([self.cls_index], dtype=torch.long)
+
         seq_len = min(self.seq_length, tokens.numel())
         if self.counts[index] is None:
             self.counts[index] = torch.zeros_like(tokens)
