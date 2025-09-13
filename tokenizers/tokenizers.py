@@ -61,7 +61,12 @@ def iterator_stream(batch_size=10000):
 
 print("Training tokenizer (streaming)...")
 tokenizer.train_from_iterator(iterator_stream(batch_size=10000), trainer)
-os.makedirs("../tokenizers", exist_ok=True)
-tok_path = "../tokenizers/tokenizer.json"
+
+# -----------------------------
+# 4. Save tokenizer in script folder
+# -----------------------------
+script_dir = os.path.dirname(__file__)
+tok_path = os.path.join(script_dir, "tokenizer.json")
 tokenizer.save(tok_path)
 print(f"✅ Tokenizer saved at {tok_path}")
+
