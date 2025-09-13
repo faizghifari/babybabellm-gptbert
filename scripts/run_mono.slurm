@@ -41,7 +41,7 @@ cd .. || exit 1
 
 # Preprocess dataset
 echo "Preprocessing /data/MONOLINGUAL/$LANG_CODE..."
-python preprocessing/updated_preprocess.py \
+python preprocess/updated_preprocess.py \
     --dataset_type monolingual \
     --mono_lang $LANG_CODE \
     --tokenizer tokenizers/tokenizer.json \
