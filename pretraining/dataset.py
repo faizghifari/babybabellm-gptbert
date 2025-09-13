@@ -1,4 +1,5 @@
 # coding=utf-8
+
 import os
 import pickle
 import random
@@ -18,15 +19,14 @@ class SpanMaskingStrategy:
         self.max_span_length = 3
 
     def __call__(self, tokens, counts=None):
-        length = tokens.size(0)
+        length = tokens.numel()
         if length == 0:
-            return torch.tensor([]), tokens.clone()
+            return torch.tensor([], dtype=torch.float), tokens.clone()
 
-        # Correct dtype for indexing
         span_lengths = torch.randint(1, self.max_span_length + 1, size=(length,), dtype=torch.long)
         cumsum = torch.cumsum(span_lengths, dim=0)
         total_length = cumsum[-1].item()
-        indices = torch.zeros(total_length, dtype=torch.long)  # long for indexing
+        indices = torch.zeros(total_length, dtype=torch.long)
         indices[cumsum - span_lengths] = torch.arange(length, dtype=torch.long)
         indices = torch.cummax(indices, dim=0)[0]
         indices = indices[:length]
@@ -42,7 +42,6 @@ class SpanMaskingStrategy:
             mask_ratios = mask_ratios * counts_p
 
         mask_ratios[tokens < self.n_special_tokens] = float('inf')
-
         replacement_p = span_random_numbers_2[indices]
         random_mask = replacement_p < self.random_p
 
@@ -51,7 +50,7 @@ class SpanMaskingStrategy:
             replacement_tokens[random_mask] = torch.randint(
                 low=self.n_special_tokens,
                 high=self.vocab_size,
-                size=[random_mask.sum().item()],
+                size=(random_mask.sum().item(),),
                 dtype=torch.long
             )
         replacement_tokens[replacement_p > (self.random_p + self.keep_p)] = self.mask_token_id
@@ -62,10 +61,7 @@ class SpanMaskingStrategy:
 class RandomIndex:
     def __init__(self, n_segments):
         self.n_segments = n_segments
-        if n_segments > 0:
-            self.indices = torch.randperm(n_segments)
-        else:
-            self.indices = torch.tensor([], dtype=torch.long)
+        self.indices = torch.randperm(n_segments) if n_segments > 0 else torch.tensor([], dtype=torch.long)
         self.index = 0
 
     def get_random_index(self):
@@ -74,12 +70,12 @@ class RandomIndex:
         if self.index >= self.n_segments:
             self.indices = torch.randperm(self.n_segments)
             self.index = 0
-        index = int(self.indices[self.index].item())
+        idx = int(self.indices[self.index].item())
         self.index += 1
-        return index
+        return idx
 
 
-# ===== shard loader & index builder =====
+# ===== Shard loader & index builder =====
 def load_shard(shard_file):
     return torch.load(shard_file, weights_only=False)
 
@@ -87,9 +83,6 @@ def load_shard(shard_file):
 def _build_segment_index_for_shard(shard_file, seq_length):
     segments = []
     documents = load_shard(shard_file)
-    # Ensure documents is iterable
-    if not isinstance(documents, (list, tuple)):
-        documents = [documents]
     for doc_idx, doc in enumerate(documents):
         if isinstance(doc, torch.Tensor) and doc.dim() == 0:
             doc = doc.unsqueeze(0)
@@ -98,7 +91,7 @@ def _build_segment_index_for_shard(shard_file, seq_length):
                 doc = torch.tensor(doc, dtype=torch.long)
             except Exception:
                 continue
-        doc_len = doc.size(0)
+        doc_len = doc.numel()
         if doc_len == 0:
             continue
         step = max(1, seq_length - 2)
@@ -135,17 +128,16 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
             print(f"Warning: failed processing shard {shard_file}: {e}")
             continue
 
-    # If no usable segments, add a dummy segment
+    # ---------- Dummy shard if empty ----------
     if len(shard_indices) == 0:
-        print(f"Warning: no segments found in {shard_dir}. Adding dummy segment.")
-        shard_indices.append((0, 0, 1))
+        print(f"Warning: no segments found in {shard_dir}. Adding dummy shard and segment.")
         if len(shard_files) == 0:
-            # Create dummy file
             dummy_file = os.path.join(shard_dir, "dummy.bin")
             torch.save(torch.tensor([0], dtype=torch.long), dummy_file)
             shard_files.append(dummy_file)
+        shard_indices.append((0, 0, 0, 1))  # guaranteed 4-tuple
+    # ----------------------------------------
 
-    # Save cache
     try:
         tmp_cache = cache_file + ".tmp"
         with open(tmp_cache, "wb") as f:
@@ -157,21 +149,18 @@ def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, wor
     return shard_indices, shard_files
 
 
-# ===== helper: show_random_item =====
+# ===== Helper: random-sample sanity check =====
 def show_random_item(self, tokenizer):
     if len(self) == 0:
         print("Dataset empty: no item to show.")
         return
     index = random.randint(0, len(self) - 1)
-    try:
-        input_ids, target_ids, attention_mask, real_mask_p = self[index]
-        print("Random item sample:")
-        print("Input ids:", input_ids)
-        print("Target ids:", target_ids)
-        print("Attention mask shape:", attention_mask.shape)
-        print("Mask ratio:", real_mask_p)
-    except Exception as e:
-        print(f"Failed to retrieve random item: {e}")
+    input_ids, target_ids, attention_mask, real_mask_p = self[index]
+    print("Random item sample:")
+    print("Input ids:", input_ids)
+    print("Target ids:", target_ids)
+    print("Attention mask shape:", attention_mask.shape)
+    print("Mask ratio:", real_mask_p)
 
 
 # ===== MaskedDataset =====
@@ -199,7 +188,7 @@ class MaskedDataset(Dataset):
         self.mask_counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
 
-        # Sanity check: random sample
+        # Sanity check
         self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
@@ -217,24 +206,24 @@ class MaskedDataset(Dataset):
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
-        seq_length = min(self.seq_length, tokens.size(0))
-        tokens = tokens[:seq_length]
+        seq_len = min(self.seq_length, tokens.numel())
+        tokens = tokens[:seq_len]
 
         if self.counts[index] is None:
             self.counts[index] = torch.zeros_like(tokens)
         if self.mask_counts[index] is None:
             self.mask_counts[index] = torch.zeros_like(tokens)
 
-        self.counts[index][:seq_length] += 1
-        mask_ratios, replacement_tokens = self.masking_strategy(tokens, self.mask_counts[index][:seq_length])
+        self.counts[index][:seq_len] += 1
+        mask_ratios, replacement_tokens = self.masking_strategy(tokens, self.mask_counts[index][:seq_len])
         input_ids, target_ids, real_mask_p = self.apply_mask(tokens, mask_ratios, replacement_tokens)
-        self.mask_counts[index][:seq_length][target_ids != -100] += 1
+        self.mask_counts[index][:seq_len][target_ids != -100] += 1
 
         input_ids = torch.cat([torch.LongTensor([self.cls_index]), input_ids])
         target_ids = torch.cat([torch.LongTensor([-100]), target_ids])
-        attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
+        attention_mask = torch.ones(seq_len + 1, seq_len + 1, dtype=torch.bool)
 
-        padding_length = self.seq_length - input_ids.size(0)
+        padding_length = self.seq_length - input_ids.numel()
         if padding_length > 0:
             input_ids = torch.cat([input_ids, torch.LongTensor([self.pad_index] * padding_length)])
             target_ids = torch.cat([target_ids, torch.LongTensor([-100] * padding_length)])
@@ -252,7 +241,7 @@ class MaskedDataset(Dataset):
 
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
         mask_p = self.args.mask_p_start + (self.args.mask_p_end - self.args.mask_p_start) * self.global_step / max(1, self.args.max_steps)
-        topk = max(1, int(mask_ratios.size(0) * mask_p + torch.rand(1).item()))
+        topk = max(1, int(mask_ratios.numel() * mask_p + torch.rand(1).item()))
         mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
         mask = mask_ratios <= mask_threshold
         target_ids = torch.where(mask, input_ids, -100)
@@ -260,14 +249,16 @@ class MaskedDataset(Dataset):
         real_mask_p = mask.sum() / mask_ratios.numel()
         return input_ids, target_ids, real_mask_p
 
+
 MaskedDataset.show_random_item = show_random_item
+
 
 # ===== CausalDataset =====
 class CausalDataset(Dataset):
     def __init__(self, shard_dir, tokenizer, args, seq_length, rank=None, world_size=None):
         self.seq_length = seq_length
-        self.n_special_tokens = args.n_special_tokens
         self.args = args
+        self.n_special_tokens = args.n_special_tokens
         self.global_step = 0
 
         self.cls_index = tokenizer.token_to_id("<s>")
@@ -281,6 +272,7 @@ class CausalDataset(Dataset):
         self.counts = [None] * len(self.shard_indices)
         self.random_index = RandomIndex(len(self.shard_indices))
 
+        # Sanity check
         self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
@@ -298,16 +290,16 @@ class CausalDataset(Dataset):
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
-        seq_length = min(self.seq_length, tokens.size(0))
+        seq_len = min(self.seq_length, tokens.numel())
         if self.counts[index] is None:
             self.counts[index] = torch.zeros_like(tokens)
-        self.counts[index][:seq_length] += 1
+        self.counts[index][:seq_len] += 1
 
-        input_ids = torch.cat([torch.LongTensor([self.cls_index]), tokens[:seq_length]])
-        target_ids = torch.cat([torch.LongTensor([-100]), tokens[:seq_length]])
-        attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
+        input_ids = torch.cat([torch.LongTensor([self.cls_index]), tokens[:seq_len]])
+        target_ids = torch.cat([torch.LongTensor([-100]), tokens[:seq_len]])
+        attention_mask = torch.ones(seq_len + 1, seq_len + 1, dtype=torch.bool)
 
-        padding_length = self.seq_length - input_ids.size(0)
+        padding_length = self.seq_length - input_ids.numel()
         if padding_length > 0:
             input_ids = torch.cat([input_ids, torch.LongTensor([self.pad_index] * padding_length)])
             target_ids = torch.cat([target_ids, torch.LongTensor([-100] * padding_length)])
@@ -324,7 +316,9 @@ class CausalDataset(Dataset):
     def set_global_step(self, global_step):
         self.global_step = global_step
 
+
 CausalDataset.show_random_item = show_random_item
+
 
 # ===== ValidationDataset =====
 class ValidationDataset(Dataset):
@@ -349,6 +343,7 @@ class ValidationDataset(Dataset):
         rng = random.Random(rank if rank is not None else seed)
         rng.shuffle(self.shard_indices)
 
+        # Sanity check
         self.show_random_item(tokenizer)
 
     def _load_segment(self, index):
@@ -366,7 +361,7 @@ class ValidationDataset(Dataset):
 
     def __getitem__(self, index):
         tokens = self._load_segment(index)
-        seq_length = min(self.seq_length - 2, tokens.size(0))
+        seq_length = min(self.seq_length - 2, tokens.numel())
 
         segment = torch.cat([torch.LongTensor([self.cls_index]), tokens[:seq_length]])
         attention_mask = torch.ones(seq_length + 1, seq_length + 1, dtype=torch.bool)
@@ -374,7 +369,7 @@ class ValidationDataset(Dataset):
         mask_ratios, replacement_tokens = self.masking_strategy(segment)
         input_ids, target_ids, real_mask_p = self.apply_mask(segment, mask_ratios, replacement_tokens)
 
-        padding_length = self.seq_length - segment.size(0) + 1
+        padding_length = self.seq_length - segment.numel() + 1
         if padding_length > 0:
             input_ids = torch.cat([input_ids, torch.LongTensor([self.pad_index] * padding_length)])
             target_ids = torch.cat([target_ids, torch.LongTensor([-100] * padding_length)])
@@ -389,13 +384,14 @@ class ValidationDataset(Dataset):
 
     def apply_mask(self, input_ids, mask_ratios, replacement_ids):
         mask_p = 0.15
-        topk = max(1, int(mask_ratios.size(0) * mask_p + 0.5))
+        topk = max(1, int(mask_ratios.numel() * mask_p + 0.5))
         mask_threshold = torch.topk(mask_ratios, topk, largest=False).values.max().item()
         mask = mask_ratios < mask_threshold
         target_ids = torch.where(mask, input_ids, -100)
         input_ids = torch.where(mask, replacement_ids, input_ids)
         real_mask_p = mask.sum() / mask_ratios.numel()
         return input_ids, target_ids, real_mask_p
+
 
 ValidationDataset.show_random_item = show_random_item
 
