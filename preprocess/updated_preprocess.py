@@ -9,22 +9,31 @@ from tqdm import tqdm
 import time
 
 # -----------------------------
-# 1. Load trained tokenizer
+# 1. Language groups
 # -----------------------------
-def load_tokenizer(tokenizer_path="../tokenizers/tokenizer.json"):
-    tokenizer = Tokenizer.from_file(tokenizer_path)
-    print(f"✅ Loaded tokenizer from {tokenizer_path}")
-    return tokenizer
-
-# -----------------------------
-# 2. Load multilingual BabyLM datasets
-# -----------------------------
-langs = [
+MONO_LANGS = ["zho","nld","deu","fra","ind","fas","ukr","bul"]
+MULTI_SMALL_LANGS = MONO_LANGS
+ALL_LANGS = [
     "zho","nld","deu","fra","ind","fas","ukr","bul",
     "yue","est","swe","cym","pol","afr","eus","ita","spa","por","jpn","heb","srp","ara","ell",
     "bug","hun","tur","ces","ace","dan","ban","hrv","mak","nso","ron","nor","isl","zul","sot","xho","kor","rus","sun","jav"
 ]
 
+def select_languages(dataset_type, mono_lang=None):
+    if dataset_type == "monolingual":
+        if mono_lang not in MONO_LANGS:
+            raise ValueError(f"Invalid mono_lang {mono_lang}. Must be one of {MONO_LANGS}")
+        return [mono_lang]
+    elif dataset_type == "multilingual_small":
+        return MULTI_SMALL_LANGS
+    elif dataset_type == "multilingual_all":
+        return ALL_LANGS
+    else:
+        raise ValueError(f"Unknown dataset_type {dataset_type}")
+
+# -----------------------------
+# 2. Load BabyLM datasets
+# -----------------------------
 def load_all_splits(langs, dev_fraction=0.05):
     splits = {"train": [], "validation": []}
     for lang in langs:
@@ -51,7 +60,7 @@ def encode_text_list(tokenizer_path, text_list):
     return [tokenizer.encode(text).ids for text in text_list]
 
 # -----------------------------
-# 4. Stream encode → shards with multiprocessing and progress
+# 4. Stream encode → shards with multiprocessing
 # -----------------------------
 def stream_encode_to_shards_mp(dataset, tokenizer_path, output_dir, seq_length=128, shard_size_bytes=100_000_000, batch_size=1000, max_workers=None):
     os.makedirs(output_dir, exist_ok=True)
@@ -63,7 +72,6 @@ def stream_encode_to_shards_mp(dataset, tokenizer_path, output_dir, seq_length=1
     max_workers = max_workers or cpu_count()
     print(f"Encoding dataset using {max_workers} processes and streaming to {output_dir}...")
 
-    # Create batches
     batches = [dataset[i:i+batch_size] for i in range(0, len(dataset), batch_size)]
     total_batches = len(batches)
     start_time = time.time()
@@ -104,25 +112,42 @@ def stream_encode_to_shards_mp(dataset, tokenizer_path, output_dir, seq_length=1
 # 5. Main
 # -----------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Encode BabyLM multilingual dataset with multiprocessing, stream shards, and show progress")
+    parser = argparse.ArgumentParser(description="Encode BabyLM dataset with automatic shard dirs")
+    parser.add_argument("--dataset_type", type=str, default="multilingual_small", choices=["monolingual","multilingual_small","multilingual_all"], help="Dataset type to process")
+    parser.add_argument("--mono_lang", type=str, default=None, help="If monolingual, specify which language")
     parser.add_argument("--tokenizer", type=str, default="../tokenizers/tokenizer.json", help="Path to tokenizer.json")
     parser.add_argument("--seq_length", type=int, default=128, help="Minimum sequence length per shard")
     parser.add_argument("--shard_size_bytes", type=int, default=100_000_000, help="Approximate shard size in bytes")
-    parser.add_argument("--shard_dir_train", type=str, default="../data/shards/train", help="Directory to save train shards")
-    parser.add_argument("--shard_dir_valid", type=str, default="../data/shards/valid", help="Directory to save validation shards")
     parser.add_argument("--batch_size", type=int, default=1000, help="Batch size for encoding")
     parser.add_argument("--max_workers", type=int, default=None, help="Max number of processes for encoding")
+    parser.add_argument("--base_dir", type=str, default="../data", help="Base directory to save shards")
     args = parser.parse_args()
 
-    # Step 1: Load datasets
+    # Step 1: Select languages
+    langs = select_languages(args.dataset_type, mono_lang=args.mono_lang)
+    print(f"Selected languages: {langs}")
+
+    # Step 2: Load datasets
     print("Loading multilingual dataset...")
     multiling_ds = load_all_splits(langs)
     print(multiling_ds)
 
-    # Step 2: Stream encode → shards with multiprocessing
-    stream_encode_to_shards_mp(multiling_ds["train"], args.tokenizer, args.shard_dir_train,
+    # Step 3: Determine output dirs
+    if args.dataset_type == "monolingual":
+        base_output_dir = os.path.join(args.base_dir, "MONOLINGUAL", langs[0])
+    elif args.dataset_type == "multilingual_small":
+        base_output_dir = os.path.join(args.base_dir, "MULTILINGUAL-SMALL")
+    else:
+        base_output_dir = os.path.join(args.base_dir, "MULTILINGUAL-ALL")
+
+    train_dir = os.path.join(base_output_dir, "train")
+    valid_dir = os.path.join(base_output_dir, "valid")
+
+    # Step 4: Stream encode → shards
+    stream_encode_to_shards_mp(multiling_ds["train"], args.tokenizer, train_dir,
                                seq_length=args.seq_length, shard_size_bytes=args.shard_size_bytes,
                                batch_size=args.batch_size, max_workers=args.max_workers)
-    stream_encode_to_shards_mp(multiling_ds["validation"], args.tokenizer, args.shard_dir_valid,
+    stream_encode_to_shards_mp(multiling_ds["validation"], args.tokenizer, valid_dir,
                                seq_length=args.seq_length, shard_size_bytes=args.shard_size_bytes,
                                batch_size=args.batch_size, max_workers=args.max_workers)
+
