@@ -47,7 +47,7 @@ CUDA_VISIBLE_DEVICES=0 python3 train_single_gpu.py \
     --train_path ../data/MULTILINGUAL-SMALL/train \
     --valid_path ../data/MULTILINGUAL-SMALL/valid \
     --tokenizer_path ../tokenizers/tokenizer.json \
-    --config_file ../configs/small.json \
+    --config_file ../configs/multilingual.json \
     --local_batch_size 32 \
     --global_batch_size 256 \
     --mixed_precision
