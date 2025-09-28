@@ -55,8 +55,9 @@ OUTPUT_DIR=${OUTPUT_DIR:-"$ROOT_DIR/model_checkpoints"}
 
 LOCAL_BATCH_SIZE=${LOCAL_BATCH_SIZE:-128}
 GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-32768}
-HYBRID_NUMERATOR=${HYBRID_NUMERATOR:-1}
 HYBRID_DENOMINATOR=${HYBRID_DENOMINATOR:-$N_GPUS}
+# Default to a balanced split: half masked, half causal
+HYBRID_NUMERATOR=${HYBRID_NUMERATOR:-$(( HYBRID_DENOMINATOR / 2 ))}
 # Get vocab_size from config to keep tokenizer/model in sync
 CONFIG_VOCAB=$(python -c 'import json,sys;print(json.load(open(sys.argv[1])).get("vocab_size", 32768))' "$CONFIG" 2>/dev/null || echo 32768)
 VOCAB_SIZE="$CONFIG_VOCAB"
