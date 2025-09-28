@@ -79,23 +79,30 @@ class RandomIndex:
 def load_shard(shard_file):
     if not os.path.exists(shard_file):
         raise FileNotFoundError(f"Shard file not found: {shard_file}")
-    # torch.load might return a list of tensors or lists
+    # torch.load might return a list of tensors or a single tensor
     return torch.load(shard_file, weights_only=False)
 
 
 def _build_segment_index_for_shard(shard_file, seq_length):
     segments = []
-    documents = load_shard(shard_file)
+    data = load_shard(shard_file)
+    # Support either: (a) single 1D tensor per shard, or (b) list of documents
+    if isinstance(data, torch.Tensor):
+        documents = [data]
+    else:
+        documents = data
     for doc_idx, doc in enumerate(documents):
-        # make each document at least 1D tensor for consistent slicing
-        if isinstance(doc, torch.Tensor) and doc.dim() == 0:
-            doc = doc.unsqueeze(0)
+        # Ensure tensor 1D for consistent slicing
         if not isinstance(doc, torch.Tensor):
             try:
                 doc = torch.tensor(doc, dtype=torch.long)
             except Exception:
                 # Skip documents we can't convert
                 continue
+        if doc.dim() == 0:
+            doc = doc.unsqueeze(0)
+        if doc.dim() > 1:
+            doc = doc.view(-1)
         doc_len = doc.numel()
         if doc_len == 0:
             continue
@@ -108,8 +115,12 @@ def _build_segment_index_for_shard(shard_file, seq_length):
 
 
 def build_or_load_indices(shard_dir, seq_length, cache_file=None, rank=None, world_size=None):
+    # Use per-(rank,world) cache to avoid races and mismatched contents across ranks
     if cache_file is None:
-        cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
+        suffix = ""
+        if rank is not None and world_size is not None:
+            suffix = f"_r{rank}-of-{world_size}"
+        cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}{suffix}.pkl")
 
     if os.path.exists(cache_file):
         try:
@@ -177,6 +188,8 @@ class BaseDataset(Dataset):
         self.args = args
         self.rank = rank
         self.world_size = world_size
+        # default global step used by some datasets (e.g., for dynamic masking)
+        self.global_step = 0
 
         cache_file = os.path.join(shard_dir, f"shard_indices_seq{seq_length}.pkl")
         self.shard_indices, self.shard_files = build_or_load_indices(shard_dir, seq_length, cache_file, rank, world_size)
@@ -190,6 +203,13 @@ class BaseDataset(Dataset):
 
         # Try preloading all shards asynchronously
         self._preload_shards_async()
+
+    # Some training loops expect every dataset to accept a global step; provide a no-op default
+    def set_global_step(self, step: int):
+        try:
+            self.global_step = int(step)
+        except Exception:
+            self.global_step = 0
 
     def _preload_shards_async(self, max_workers=4):
         """Load all shards in parallel using threads with tqdm progress."""
@@ -218,16 +238,22 @@ class BaseDataset(Dataset):
             else:
                 shard = self._loaded_shard
 
-        # Grab the document; ensure it's a 1D tensor we can slice
-        doc = shard[doc_idx]
-        if not isinstance(doc, torch.Tensor):
-            try:
-                doc = torch.tensor(doc, dtype=torch.long)
-            except Exception:
-                # return empty tensor if doc not usable
-                return torch.tensor([], dtype=torch.long)
+        # If shard is a single tensor, treat it as one document (doc_idx must be 0)
+        if isinstance(shard, torch.Tensor):
+            doc = shard
+        else:
+            # List/sequence of documents
+            doc = shard[doc_idx]
+            if not isinstance(doc, torch.Tensor):
+                try:
+                    doc = torch.tensor(doc, dtype=torch.long)
+                except Exception:
+                    return torch.tensor([], dtype=torch.long)
+
         if doc.dim() == 0:
             doc = doc.unsqueeze(0)
+        if doc.dim() > 1:
+            doc = doc.view(-1)
 
         # If start beyond doc length, return empty to be handled by caller
         if start >= doc.numel():

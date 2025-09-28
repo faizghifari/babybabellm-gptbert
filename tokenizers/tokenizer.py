@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 import numpy as np
 from datasets import load_dataset, concatenate_datasets, DatasetDict
 from tokenizers import Tokenizer
@@ -39,8 +40,22 @@ def load_all_splits(langs, dev_fraction=0.05):
         for split in splits
     })
 
-print("Loading multilingual dataset...")
-multiling_ds = load_all_splits(langs)
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train (multi)lingual BPE tokenizer")
+    parser.add_argument("--vocab_size", type=int, default=int(os.environ.get("VOCAB_SIZE", 32768)),
+                        help="Target vocabulary size (can also set VOCAB_SIZE env). Default=32768")
+    parser.add_argument("--dev_fraction", type=float, default=0.05, help="Fraction for validation split when dataset lacks one")
+    parser.add_argument("--output", type=str, default="tokenizer.json", help="Relative output filename inside this folder")
+    parser.add_argument("--no_stream", action="store_true", help="Disable streaming iterator (load all in memory)")
+    return parser.parse_args()
+
+args = parse_args()
+
+if args.vocab_size <= 32:  # must exceed special tokens length
+    raise ValueError(f"vocab_size too small ({args.vocab_size}); must be > 32")
+
+print(f"Loading multilingual dataset (dev_fraction={args.dev_fraction})...")
+multiling_ds = load_all_splits(langs, dev_fraction=args.dev_fraction)
 print(multiling_ds)
 
 # -----------------------------
@@ -51,22 +66,36 @@ tokenizer = Tokenizer(BPE(unk_token="<unk>"))
 tokenizer.normalizer = normalizers.NFKC()
 tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=True)
 tokenizer.decoder = decoders.ByteLevel()
-trainer = BpeTrainer(vocab_size=32768, special_tokens=special_tokens)
+trainer = BpeTrainer(vocab_size=args.vocab_size, special_tokens=special_tokens)
 
 # Streaming iterator for training
-def iterator_stream(batch_size=10000):
-    ds = multiling_ds["train"]
-    for i in range(0, len(ds), batch_size):
-        yield ds[i:i+batch_size]["text"]
-
-print("Training tokenizer (streaming)...")
-tokenizer.train_from_iterator(iterator_stream(batch_size=10000), trainer)
+if args.no_stream:
+    print("Training tokenizer (non-stream / in-memory)...")
+    texts = multiling_ds["train"]["text"]
+    tokenizer.train_from_iterator(texts, trainer)
+else:
+    def iterator_stream(batch_size=10000):
+        ds = multiling_ds["train"]
+        for i in range(0, len(ds), batch_size):
+            yield ds[i:i+batch_size]["text"]
+    print("Training tokenizer (streaming)...")
+    tokenizer.train_from_iterator(iterator_stream(batch_size=10000), trainer)
 
 # -----------------------------
 # 4. Save tokenizer in script folder
 # -----------------------------
 script_dir = os.path.dirname(__file__)
-tok_path = os.path.join(script_dir, "tokenizer.json")
+tok_path = os.path.join(script_dir, args.output)
 tokenizer.save(tok_path)
-print(f"✅ Tokenizer saved at {tok_path}")
+meta = {
+    "vocab_size": args.vocab_size,
+    "dev_fraction": args.dev_fraction,
+    "output": args.output,
+    "streaming": not args.no_stream,
+    "languages": langs,
+    "special_tokens": special_tokens,
+}
+with open(os.path.join(script_dir, "tokenizer_meta.json"), "w", encoding="utf-8") as f:
+    json.dump(meta, f, ensure_ascii=False, indent=2)
+print(f"✅ Tokenizer saved at {tok_path} (vocab_size={args.vocab_size})")
 

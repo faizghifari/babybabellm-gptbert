@@ -16,13 +16,13 @@ MULTI_SMALL_LANGS = MONO_LANGS
 ALL_LANGS = [
     "zho","nld","deu","fra","ind","fas","ukr","bul",
     "yue","est","swe","cym","pol","afr","eus","ita","spa","por","jpn","heb","srp","ara","ell",
-    "bug","hun","tur","ces","ace","dan","ban","hrv","mak","nso","ron","nor","isl","zul","sot","xho","kor","rus","sun","jav"
+    "bug","hun","tur","ces","ace","dan","ban","hrv","mak","nso","ron","nor","isl","zul","sot","xho","kor","rus","sun","jav","min"
 ]
 
 def select_languages(dataset_type, mono_lang=None):
     if dataset_type == "monolingual":
-        if mono_lang not in MONO_LANGS:
-            raise ValueError(f"Invalid mono_lang {mono_lang}. Must be one of {MONO_LANGS}")
+        if mono_lang not in ALL_LANGS:
+            raise ValueError(f"Invalid mono_lang {mono_lang}. Must be one of {ALL_LANGS}")
         return [mono_lang]
     elif dataset_type == "multilingual_small":
         return MULTI_SMALL_LANGS
@@ -113,7 +113,7 @@ def stream_encode_to_shards_mp(dataset, tokenizer_path, output_dir, seq_length=1
 # -----------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Encode BabyLM dataset with automatic shard dirs")
-    parser.add_argument("--dataset_type", type=str, default="multilingual_small", choices=["monolingual","multilingual_small","multilingual_all"], help="Dataset type to process")
+    parser.add_argument("--dataset_type", type=str, default="monolingual", choices=["monolingual","multilingual_small","multilingual_all"], help="Dataset type to process")
     parser.add_argument("--mono_lang", type=str, default=None, help="If monolingual, specify which language")
     parser.add_argument("--tokenizer", type=str, default="../tokenizers/tokenizer.json", help="Path to tokenizer.json")
     parser.add_argument("--seq_length", type=int, default=128, help="Minimum sequence length per shard")

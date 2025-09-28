@@ -3,8 +3,38 @@ import torch
 from utils import is_main_process
 
 
-if int(os.environ["SLURM_PROCID"]) == 0:
-    import wandb
+def _get_global_rank_default0() -> int:
+    """Best-effort to determine global rank without assuming SLURM.
+
+    Priority order:
+    - torchrun sets RANK
+    - SLURM sets SLURM_PROCID
+    Fallback to 0 when unknown.
+    """
+    for k in ("RANK", "SLURM_PROCID"):
+        v = os.environ.get(k)
+        if v is not None:
+            try:
+                return int(v)
+            except ValueError:
+                pass
+    return 0
+
+
+def _wandb_is_enabled() -> bool:
+    disabled = os.environ.get("WANDB_DISABLED")
+    return disabled not in {"1", "true", "True"}
+
+
+# Import wandb only on the main process if enabled; avoid KeyError when not under SLURM
+try:
+    if _get_global_rank_default0() == 0 and _wandb_is_enabled():
+        import wandb  # type: ignore
+    else:
+        wandb = None  # type: ignore
+except Exception:
+    # If wandb isn't available or any unexpected error occurs, disable logging gracefully
+    wandb = None  # type: ignore
 
 
 class ModelLogger:
@@ -17,9 +47,7 @@ class ModelLogger:
         self.id_to_name = {
             id(module): str(name) for name, module in module.named_modules()
         }
-        self.activations = {
-            id(module): None for module in module.modules()
-        }
+        self.activations = {id(module): None for module in module.modules()}
         self.hooks = []
 
     def __enter__(self, *args, **kwargs):
@@ -38,13 +66,15 @@ class ModelLogger:
 
     @torch.no_grad()
     def _log_activations(self):
+        if wandb is None:
+            return
         wandb.log(
             {
                 f"activations_mean/{self.id_to_name[m_id]}": a.mean().item()
                 for m_id, a in self.activations.items()
                 if a is not None
             },
-            commit=False
+            commit=False,
         )
         wandb.log(
             {
@@ -52,32 +82,40 @@ class ModelLogger:
                 for m_id, a in self.activations.items()
                 if a is not None
             },
-            commit=False
+            commit=False,
         )
 
     @torch.no_grad()
     def _log_parameter_histograms(self):
+        if wandb is None:
+            return
         for name, param in self.module.named_parameters():
             wandb.log(
                 {
                     f"parameters_mean/{name}": param.data.mean().cpu().item(),
-                    f"parameters_norm/{name}": torch.linalg.norm(param.data).cpu().item(),
+                    f"parameters_norm/{name}": torch.linalg.norm(param.data)
+                    .cpu()
+                    .item(),
                     f"parameters_std/{name}": param.data.std().cpu().item(),
                 },
-                commit=False
+                commit=False,
             )
 
     @torch.no_grad()
     def _log_gradients_histograms(self):
+        if wandb is None:
+            return
         for name, param in self.module.named_parameters():
             if param.grad is not None:
                 wandb.log(
                     {
                         f"gradients_mean/{name}": param.grad.mean().cpu().item(),
-                        f"gradients_norm/{name}": torch.linalg.norm(param.grad).cpu().item(),
+                        f"gradients_norm/{name}": torch.linalg.norm(param.grad)
+                        .cpu()
+                        .item(),
                         f"gradients_std/{name}": param.grad.std().cpu().item(),
                     },
-                    commit=False
+                    commit=False,
                 )
 
     def __exit__(self, *args, **kwargs):
