@@ -487,6 +487,17 @@ def training_epoch(
         len(train_dataloader), (args.max_steps - global_step) * args.accumulate_steps
     )
 
+    # Determine schedule thresholds in global steps (for seq_length changes)
+    th1 = int(0.7 * args.max_steps + 0.5)
+    th2 = int(0.9 * args.max_steps + 0.5)
+    def phase(step: int) -> int:
+        if step >= th2:
+            return 2
+        if step >= th1:
+            return 1
+        return 0
+    current_phase = phase(global_step)
+
     # Synchronize planned local loop length across ranks
     try:
         _ns = torch.tensor([num_steps], device=args.device, dtype=torch.long)
@@ -655,6 +666,13 @@ def training_epoch(
         global_step += 1
         if pbar is not None:
             pbar.update(1)
+
+        # If we crossed a schedule boundary, break to reload dataloaders
+        new_phase = phase(global_step)
+        if new_phase > current_phase:
+            if pbar is not None:
+                pbar.close()
+            return global_step
         if global_step >= args.max_steps:
             if pbar is not None:
                 pbar.close()
