@@ -555,9 +555,11 @@ def training_epoch(
         micro_in_accum += 1
         if (local_step + 1) % args.accumulate_steps != 0:
             if pbar is not None:
+                dataset_obj = getattr(train_dataloader, 'dataset', getattr(train_dataloader, '_dataset', None))
+                seq_length = getattr(dataset_obj, 'seq_length', "N/A") if dataset_obj is not None else "N/A"
                 pbar.set_postfix({
                     "micro": f"{micro_in_accum}/{args.accumulate_steps}",
-                    "seq": getattr(train_dataloader, 'dataset', getattr(train_dataloader, '_dataset', None)).seq_length
+                    "seq": seq_length
                 })
             continue
         micro_in_accum = 0
