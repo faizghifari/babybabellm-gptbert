@@ -96,7 +96,11 @@ fi
 
 
 # If shards missing (no .bin files) then prepare tokenizer and run preprocessing
-TOK_FILE="${TOKENIZER_PATH:-$TOK_DIR/tokenizer_${PREPROCESS_MONO_LANG}_vs${VOCAB_SIZE}.json}"
+if [[ -n "${PREPROCESS_MONO_LANG:-}" ]]; then
+  TOK_FILE="${TOKENIZER_PATH:-$TOK_DIR/tokenizer_${PREPROCESS_MONO_LANG}_vs${VOCAB_SIZE}.json}"
+else
+  TOK_FILE="${TOKENIZER_PATH:-$TOK_DIR/tokenizer_multilingual_vs${VOCAB_SIZE}.json}"
+fi
 
 has_shards() {
   local d="$1"
