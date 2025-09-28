@@ -3,8 +3,8 @@ import torch
 from utils import is_main_process
 
 
-if int(os.environ["SLURM_PROCID"]) == 0:
-    import wandb
+# if int(os.environ["SLURM_PROCID"]) == 0:
+import wandb
 
 
 class ModelLogger:
