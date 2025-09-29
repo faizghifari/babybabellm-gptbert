@@ -138,7 +138,7 @@ def build_tokenizer(lang: str, args) -> PreTrainedTokenizerFast:
     return tokenizer
 
 
-def write_remote_code_files(target_dir: Path, causal: bool):
+def write_remote_code_files(target_dir: Path, causal: bool, force_causal_mask: bool):
     """Package the original training architecture for remote inference.
 
     This embeds the exact model as trained (from gpt-bert/pretraining/model_extra.py)
@@ -159,7 +159,8 @@ def write_remote_code_files(target_dir: Path, causal: bool):
         "        self.num_attention_heads = kwargs.pop('num_attention_heads', 12)\n"
         "        self.num_hidden_layers = kwargs.pop('num_hidden_layers', 12)\n"
         "        self.vocab_size = kwargs.pop('vocab_size', 16384)\n"
-        "        self.layer_norm_eps = kwargs.pop('layer_norm_eps', 1e-5)\n"
+    "        self.layer_norm_eps = kwargs.pop('layer_norm_eps', 1e-5)\n"
+    "        self.force_causal_mask = kwargs.pop('force_causal_mask', False)\n"
         f"        self.auto_map = {{\n"
         f"            'AutoConfig': 'configuration_gpt_bert.GPTBertConfig',\n"
         f"            'AutoModel': 'modeling_gpt_bert.{ 'GPTBertForCausalLM' if causal else 'GPTBertForMaskedLM' }',\n"
@@ -176,13 +177,15 @@ def write_remote_code_files(target_dir: Path, causal: bool):
     except Exception as e:
         raise RuntimeError(f"Failed to read original model code at {orig_path}: {e}")
 
-    wrapper_code = textwrap.dedent(
+    wrapper_template = textwrap.dedent(
         """
         from transformers import PreTrainedModel
         from transformers.modeling_outputs import MaskedLMOutput, CausalLMOutputWithCrossAttentions
         from .configuration_gpt_bert import GPTBertConfig
         import torch
         import torch.nn as nn
+
+        DEFAULT_FORCE_CAUSAL_MASK = __FORCE_CAUSAL_MASK__
 
 
         def _normalize_mask_tensor(mask):
@@ -205,7 +208,12 @@ def write_remote_code_files(target_dir: Path, causal: bool):
             return mask
 
 
-        def _build_babylm_attention_mask(input_ids, attention_mask):
+        def _build_future_causal_mask(batch_size, seq_len, device):
+            base = torch.triu(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), diagonal=1)
+            return base.unsqueeze(0).expand(batch_size, -1, -1)
+
+
+        def _build_babylm_attention_mask(input_ids, attention_mask, force_causal=False):
             batch_size, seq_len = input_ids.shape[:2]
             device = input_ids.device
             if attention_mask is None:
@@ -251,6 +259,9 @@ def write_remote_code_files(target_dir: Path, causal: bool):
                     new_mask = torch.ones(batch_size, seq_len, seq_len, dtype=torch.bool, device=device)
                     new_mask[:, :rows, :cols] = mask[:, :rows, :cols]
                     mask = new_mask
+            if force_causal:
+                future_mask = _build_future_causal_mask(mask.size(0), seq_len, device)
+                mask = mask | future_mask
             mask = _ensure_valid_rows(mask)
             return mask.unsqueeze(1)
 
@@ -262,6 +273,7 @@ def write_remote_code_files(target_dir: Path, causal: bool):
             def __init__(self, config: GPTBertConfig):
                 super().__init__(config)
                 self.model = Bert(config)
+                self.force_causal_mask = getattr(config, "force_causal_mask", DEFAULT_FORCE_CAUSAL_MASK)
 
             def tie_weights(self):
                 try:
@@ -271,7 +283,7 @@ def write_remote_code_files(target_dir: Path, causal: bool):
                 return super().tie_weights()
 
             def forward(self, input_ids, attention_mask=None, labels=None):
-                mask_4d = _build_babylm_attention_mask(input_ids, attention_mask)
+                mask_4d = _build_babylm_attention_mask(input_ids, attention_mask, force_causal=self.force_causal_mask)
                 static_embeddings, relative_embedding = self.model.embedding(input_ids)
                 if static_embeddings.dim() == 3 and static_embeddings.shape[0] == input_ids.shape[0]:
                     static_embeddings = static_embeddings.transpose(0, 1)
@@ -296,12 +308,13 @@ def write_remote_code_files(target_dir: Path, causal: bool):
             def __init__(self, config: GPTBertConfig):
                 super().__init__(config)
                 self.model = Bert(config)
+                self.force_causal_mask = getattr(config, "force_causal_mask", DEFAULT_FORCE_CAUSAL_MASK)
 
             def prepare_inputs_for_generation(self, input_ids, **kwargs):
                 return {'input_ids': input_ids, 'attention_mask': kwargs.get('attention_mask', None)}
 
             def forward(self, input_ids, attention_mask=None, labels=None):
-                mask_4d = _build_babylm_attention_mask(input_ids, attention_mask)
+                mask_4d = _build_babylm_attention_mask(input_ids, attention_mask, force_causal=self.force_causal_mask)
                 static_embeddings, relative_embedding = self.model.embedding(input_ids)
                 if static_embeddings.dim() == 3 and static_embeddings.shape[0] == input_ids.shape[0]:
                     static_embeddings = static_embeddings.transpose(0, 1)
@@ -322,13 +335,15 @@ def write_remote_code_files(target_dir: Path, causal: bool):
         """
     )
 
+    wrapper_code = wrapper_template.replace("__FORCE_CAUSAL_MASK__", "True" if force_causal_mask else "False")
+
     full_modeling = (
         "# Original training architecture (verbatim)\n" + orig_code + "\n\n# HF wrappers that preserve state dict keys and behavior\n" + wrapper_code
     )
     (target_dir / "modeling_gpt_bert.py").write_text(full_modeling, encoding="utf-8")
 
 
-def _patch_rehost_config(config_path: Path, prefer_causal: bool):
+def _patch_rehost_config(config_path: Path, prefer_causal: bool, force_causal_mask: bool):
     """Patch an existing config.json for rehosting.
 
     - Keep original model_type as-is.
@@ -369,10 +384,12 @@ def _patch_rehost_config(config_path: Path, prefer_causal: bool):
             "AutoModelForCausalLM": "modeling_gpt_bert.GPTBertForCausalLM",
             "AutoModelForMaskedLM": "modeling_gpt_bert.GPTBertForMaskedLM",
         }
+    if force_causal_mask:
+        data["force_causal_mask"] = True
     config_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _write_rehost_readme(out_dir: Path, src_repo: str, dst_repo: str, prefer_causal: bool):
+def _write_rehost_readme(out_dir: Path, src_repo: str, dst_repo: str, prefer_causal: bool, force_causal_mask: bool):
     note = [
         f"# {dst_repo}",
         "", 
@@ -400,6 +417,12 @@ def _write_rehost_readme(out_dir: Path, src_repo: str, dst_repo: str, prefer_cau
             "model=AutoModelForCausalLM.from_pretrained(m, trust_remote_code=True)",
             "print(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tokens=20)[0], skip_special_tokens=True))",
             "```",
+        ]
+    if force_causal_mask:
+        note += [
+            "",
+            "### Forced Causal Attention",
+            "This rehost enforces a triangular causal mask inside the remote code so the hybrid GPT-BERT layers cannot attend to future tokens.",
         ]
     (out_dir / "README.md").write_text("\n".join(note) + "\n", encoding="utf-8")
 
@@ -480,7 +503,7 @@ def rehost_repos(args):
                 print(f"[rehost] Failed snapshot {src}: {e}")
                 continue
             # Ensure remote code present
-            write_remote_code_files(local_src, causal=True)  # prefer causal mapping globally for rehost
+            write_remote_code_files(local_src, causal=True, force_causal_mask=args.force_causal_mask)  # prefer causal mapping globally for rehost
             # Patch config
             cfg_path = local_src / "config.json"
             if not cfg_path.exists():
@@ -494,9 +517,9 @@ def rehost_repos(args):
                     "vocab_size": 16384,
                 }
                 cfg_path.write_text(json.dumps(minimal, indent=2), encoding="utf-8")
-            _patch_rehost_config(cfg_path, prefer_causal=True)
+            _patch_rehost_config(cfg_path, prefer_causal=True, force_causal_mask=args.force_causal_mask)
             # README
-            _write_rehost_readme(local_src, src, dst_repo, prefer_causal=True)
+            _write_rehost_readme(local_src, src, dst_repo, prefer_causal=True, force_causal_mask=args.force_causal_mask)
             if args.push:
                 try:
                     create_repo(dst_repo, exist_ok=True, private=False)
@@ -537,6 +560,7 @@ def write_model_card(
     available_variants: List[str],
     raw_files: List[str],
     causal: bool,
+    force_causal_mask: bool,
 ):
     files_listing = []
     if (out_dir / "model.safetensors").exists():
@@ -553,6 +577,7 @@ def write_model_card(
     files_section = "\n".join(files_listing) if files_listing else "(generated after conversion)"
 
     causal_section = "" if not causal else f"""\n### Causal LM Wrapper\nThis repo includes a lightweight GPTBertForCausalLM wrapper.\nGeneration example:\n```python\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\nmid='{repo_id}'\ntok=AutoTokenizer.from_pretrained(mid)\nmodel=AutoModelForCausalLM.from_pretrained(mid, trust_remote_code=True)\nprint(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tokens=20)[0], skip_special_tokens=True))\n```\n"""
+    mask_section = "" if not force_causal_mask else """\n### Forced Causal Attention\nCausal attention is enforced during inference by applying a triangular future mask inside the remote code.\nThis prevents the hybrid GPT-BERT layers from attending to future tokens even when a bidirectional mask is provided.\n"""
     # Minimal YAML frontmatter for Hub metadata validation
     header = "\n".join([
         "---",
@@ -563,7 +588,7 @@ def write_model_card(
         "---",
         "",
     ])
-    card = header + f"""# {repo_id}\n\nGPT-BERT style BabyBabyLLM model for language **{lang}**.\n\nThis repository may include both *main* and *EMA* variants.\n\n**Default variant exposed to generic loaders:** `{default_variant}`\n\n## Variants Available\n{', '.join(sorted(available_variants))}\n\n## Files\n{files_section}\n\n## Configuration\n```json\n{json.dumps(config_dict, indent=2)}\n```\nTokenizer file: `{Path(getattr(tokenizer, '_tokenizer_file', 'unknown')).name}`\n\n## Quick Usage\n```python\nfrom transformers import AutoTokenizer, AutoModelForMaskedLM\nmodel_id = '{repo_id}'\ntok = AutoTokenizer.from_pretrained(model_id)\nmodel = AutoModelForMaskedLM.from_pretrained(model_id, trust_remote_code=True)\nout = model(**tok('Hello world', return_tensors='pt'))\n```\n{causal_section}\n## Notes\n- Converted on {datetime.now(timezone.utc).isoformat()}\n- Weights are the exact trained parameters; no new layers were initialized.\n- Requires `trust_remote_code=True` due to custom architecture.\n"""
+    card = header + f"""# {repo_id}\n\nGPT-BERT style BabyBabyLLM model for language **{lang}**.\n\nThis repository may include both *main* and *EMA* variants.\n\n**Default variant exposed to generic loaders:** `{default_variant}`\n\n## Variants Available\n{', '.join(sorted(available_variants))}\n\n## Files\n{files_section}\n\n## Configuration\n```json\n{json.dumps(config_dict, indent=2)}\n```\nTokenizer file: `{Path(getattr(tokenizer, '_tokenizer_file', 'unknown')).name}`\n\n## Quick Usage\n```python\nfrom transformers import AutoTokenizer, AutoModelForMaskedLM\nmodel_id = '{repo_id}'\ntok = AutoTokenizer.from_pretrained(model_id)\nmodel = AutoModelForMaskedLM.from_pretrained(model_id, trust_remote_code=True)\nout = model(**tok('Hello world', return_tensors='pt'))\n```\n{causal_section}{mask_section}\n## Notes\n- Converted on {datetime.now(timezone.utc).isoformat()}\n- Weights are the exact trained parameters; no new layers were initialized.\n- Requires `trust_remote_code=True` due to custom architecture.\n"""
     (out_dir / "README.md").write_text(card, encoding="utf-8")
 
 
@@ -624,7 +649,12 @@ def _save_single_variant(
     return config_dict, state_dict
 
 
-def _write_primary_config(out_dir: Path, config_dict: Dict[str, Any], prefer_causal: bool = False):
+def _write_primary_config(
+    out_dir: Path,
+    config_dict: Dict[str, Any],
+    prefer_causal: bool = False,
+    force_causal_mask: bool = False,
+):
     """Write a canonical config.json for the repo (after variants are saved)."""
     cfg = dict(config_dict)
     cfg.setdefault("model_type", "gpt_bert")
@@ -648,6 +678,8 @@ def _write_primary_config(out_dir: Path, config_dict: Dict[str, Any], prefer_cau
             "AutoModelForCausalLM": "modeling_gpt_bert.GPTBertForCausalLM",
             "AutoModelForMaskedLM": "modeling_gpt_bert.GPTBertForMaskedLM",
         }
+    if force_causal_mask:
+        cfg["force_causal_mask"] = True
     # Populate token ids if tokenizer available
     try:
         from transformers import AutoTokenizer
@@ -713,10 +745,12 @@ def convert_language(
                 out_dir.mkdir(parents=True, exist_ok=True)
                 print(f"[+] Converting {ckpt.name} -> {repo_id} (separate repo)")
                 config_dict, state_dict = _save_single_variant(ckpt, base_config, args.force_vocab_match, lang, tag, out_dir)
+                if args.force_causal_mask:
+                    config_dict["force_causal_mask"] = True
                 tokenizer = build_tokenizer(lang, args)
                 tokenizer.save_pretrained(out_dir)
                 (out_dir / "original_project_config.json").write_text(json.dumps(base_config, indent=2), encoding="utf-8")
-                write_remote_code_files(out_dir, args.causal)
+                write_remote_code_files(out_dir, args.causal, args.force_causal_mask)
                 raw_files = _copy_raw_checkpoints(out_dir, ckpt, args.include_raw)
                 # Pointer files (default only if matches)
                 if tag == args.default_variant:
@@ -727,9 +761,9 @@ def convert_language(
                     # create alias if default not present yet
                     if not (out_dir / "model.safetensors").exists():
                         shutil.copy2(out_dir / f"model_{tag}.safetensors", out_dir / "model.safetensors")
-                write_model_card(out_dir, repo_id, lang, config_dict, tokenizer, args.default_variant, [tag], raw_files, args.causal)
+                write_model_card(out_dir, repo_id, lang, config_dict, tokenizer, args.default_variant, [tag], raw_files, args.causal, args.force_causal_mask)
                 # Ensure canonical config.json present (save_pretrained temp copy discarded)
-                _write_primary_config(out_dir, config_dict, prefer_causal=args.causal)
+                _write_primary_config(out_dir, config_dict, prefer_causal=args.causal, force_causal_mask=args.force_causal_mask)
                 if args.push:
                     create_repo(repo_id, exist_ok=True, private=False)
                     upload_folder(folder_path=str(out_dir), repo_id=repo_id, commit_message=f"Add {tag} weights for {lang}")
@@ -750,7 +784,7 @@ def convert_language(
         tokenizer = build_tokenizer(lang, args)
         tokenizer.save_pretrained(out_dir)
         (out_dir / "original_project_config.json").write_text(json.dumps(base_config, indent=2), encoding="utf-8")
-        write_remote_code_files(out_dir, args.causal)
+        write_remote_code_files(out_dir, args.causal, args.force_causal_mask)
         raw_files_accum: List[str] = []
         default_state_dict: Optional[Dict[str, torch.Tensor]] = None
         final_config: Optional[Dict[str, Any]] = None
@@ -758,6 +792,8 @@ def convert_language(
         for tag, ckpt in variants_to_do:
             print(f"[+] Converting {ckpt.name} ({tag}) -> {repo_id}")
             config_dict, state_dict = _save_single_variant(ckpt, base_config, args.force_vocab_match, lang, tag, out_dir)
+            if args.force_causal_mask:
+                config_dict["force_causal_mask"] = True
             final_config = config_dict  # Same config for all
             available_variant_tags.append(tag)
             new_raw = _copy_raw_checkpoints(out_dir, ckpt, args.include_raw)
@@ -777,8 +813,8 @@ def convert_language(
             if src.exists():
                 shutil.copy2(src, out_dir / "model.safetensors")
         assert final_config is not None
-        write_model_card(out_dir, repo_id, lang, final_config, tokenizer, args.default_variant, available_variant_tags, raw_files_accum, args.causal)
-        _write_primary_config(out_dir, final_config, prefer_causal=args.causal)
+        write_model_card(out_dir, repo_id, lang, final_config, tokenizer, args.default_variant, available_variant_tags, raw_files_accum, args.causal, args.force_causal_mask)
+        _write_primary_config(out_dir, final_config, prefer_causal=args.causal, force_causal_mask=args.force_causal_mask)
         if args.push:
             create_repo(repo_id, exist_ok=True, private=False)
             upload_folder(folder_path=str(out_dir), repo_id=repo_id, commit_message=f"Add {' & '.join(available_variant_tags)} weights for {lang}")
@@ -807,6 +843,7 @@ def main():
     parser.add_argument("--include-raw", action="store_true", help="Copy original raw training checkpoint(s) into repo (current & counterpart if present).")
     parser.add_argument("--default-variant", choices=["ema", "main"], default="ema", help="Which variant to expose as default (model.safetensors & pytorch_model.bin).")
     parser.add_argument("--causal", action="store_true", help="Emit CausalLM wrapper and push to repo id with -causal suffix.")
+    parser.add_argument("--force-causal-mask", action="store_true", help="Embed a triangular causal mask into the remote code so future tokens are always masked.")
     parser.add_argument("--rehost-prefix", default=None, help="Rehost existing Hub repos whose ids start with this prefix (e.g. suchirsalham/babybabellm-mono-). When set, skips local checkpoint conversion.")
     # New: Repo naming template
     parser.add_argument(
@@ -874,6 +911,8 @@ def main():
             }
         else:
             base_config = json.loads(cfg_path.read_text(encoding="utf-8"))
+    if args.force_causal_mask:
+        base_config = {**base_config, "force_causal_mask": True}
     print("Base config:")
     print(json.dumps(base_config, indent=2))
 
