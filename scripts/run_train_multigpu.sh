@@ -49,7 +49,7 @@ SAVE_EVERY=${SAVE_EVERY:-1000}
 VALIDATE_EVERY=${VALIDATE_EVERY:-1000}
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
-NAME=${NAME:-"gptbert_baby_multi"}
+NAME=${NAME:-}
 OUTPUT_DIR=${OUTPUT_DIR:-"$ROOT_DIR/model_checkpoints"}
 
 
@@ -61,6 +61,17 @@ HYBRID_NUMERATOR=${HYBRID_NUMERATOR:-$(( HYBRID_DENOMINATOR / 2 ))}
 # Get vocab_size from config to keep tokenizer/model in sync
 CONFIG_VOCAB=$(python -c 'import json,sys;print(json.load(open(sys.argv[1])).get("vocab_size", 32768))' "$CONFIG" 2>/dev/null || echo 32768)
 VOCAB_SIZE="$CONFIG_VOCAB"
+
+# Compute default NAME if not provided: monolingual -> babylm-{lang}-{num}_{den}; multilingual -> babylm-multilingual-{all|small}-{num}_{den}
+if [[ -z "${NAME}" ]]; then
+  if [[ "$PREPROCESS_DATASET_TYPE" == "monolingual" ]]; then
+    NAME="babylm-${PREPROCESS_MONO_LANG}-${HYBRID_NUMERATOR}_${HYBRID_DENOMINATOR}"
+  else
+    ml_kind="small"
+    if [[ "$PREPROCESS_DATASET_TYPE" == "multilingual_all" ]]; then ml_kind="all"; fi
+    NAME="babylm-multilingual-${ml_kind}-${HYBRID_NUMERATOR}_${HYBRID_DENOMINATOR}"
+  fi
+fi
 
 export WANDB_DISABLED=${WANDB_DISABLED:-0}
 WANDB_PROJECT=${WANDB_PROJECT:-BabyLM-GPT-BERT}
