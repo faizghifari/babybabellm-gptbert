@@ -31,31 +31,31 @@ Defaults:
 
 1. **Train an English checkpoint** using DDP. This example assumes two GPUs on a single host and saves checkpoints under `model_checkpoints/`:
 
-	```bash
-	CONFIG=configs/base.json \
-	PREPROCESS_DATASET_TYPE=monolingual PREPROCESS_MONO_LANG=eng \
-	N_GPUS=2 NAME="eng-ddp-baseline" MAX_STEPS=1250 \
-	./scripts/run_train_multigpu.sh
-	```
+   ```bash
+   CONFIG=configs/base.json \
+   PREPROCESS_DATASET_TYPE=monolingual PREPROCESS_MONO_LANG=eng \
+   N_GPUS=2 NAME="eng-ddp-baseline" MAX_STEPS=1250 \
+   ./scripts/run_train_multigpu.sh
+   ```
 
-	Monitor the run in the console or W&B (unless disabled). Checkpoints will land in `model_checkpoints/mono_eng_small_1_2*.bin` when the job finishes.
+   Monitor the run in the console or W&B (unless disabled). Checkpoints will land in `model_checkpoints/mono_eng_small_1_2*.bin` when the job finishes.
 
 2. **Convert the trained weights to Hugging Face format** and optionally push them to the Hub. The command below keeps both main & EMA variants, copies the raw checkpoints, and injects the causal attention mask into the remote code for safer generation:
 
-	```bash
-	HF_USERNAME=your-hub-handle \
-	python scripts/convert_and_push_mono_1_2.py \
-	  --languages eng \
-	  --variant both \
-	  --include-raw \
-	  --force-causal-mask \
-	  --repo-template "{username}/babybabellm-gptbert-{lang}{causal_suffix}" \
-	  --default-variant ema \
-	  --push
-	```
+   ```bash
+   HF_USERNAME=your-hub-handle \
+   python scripts/convert_and_push_mono_1_2.py \
+     --languages eng \
+     --variant both \
+     --include-raw \
+     --force-causal-mask \
+     --repo-template "{username}/babybabellm-gptbert-{lang}{causal_suffix}" \
+     --default-variant ema \
+     --push
+   ```
 
-	- Drop `--push` to stage files locally under `converted/` for inspection before uploading.
-	- Remove `--force-causal-mask` if you want to preserve the original bidirectional attention behavior (not recommended for causal evaluation).
+   - Drop `--push` to stage files locally under `converted/` for inspection before uploading.
+   - Remove `--force-causal-mask` if you want to preserve the original bidirectional attention behavior (not recommended for causal evaluation).
 
 ## SLURM
 
