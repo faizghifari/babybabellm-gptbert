@@ -37,12 +37,16 @@ from tokenizers import Tokenizer
 from transformers import PreTrainedTokenizerFast
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+
 # -----------------------------
 # Defaults and patterns
 # -----------------------------
 REPO_USERNAME_ENV_VAR = "HF_USERNAME"
 
-CHECKPOINT_DIR = Path("babybabellm-gptbert/model_checkpoints")
+CHECKPOINT_DIR = PROJECT_ROOT / "model_checkpoints"
 CHECKPOINT_GLOB = "mono_*_small_1_2*.bin"
 CHECKPOINT_PATTERN = re.compile(
     r"^mono_(?P<lang>[a-z]{3})_small_1_2(?P<ema>_ema)?\.bin$"
@@ -109,10 +113,11 @@ def build_tokenizer(lang: str, args) -> PreTrainedTokenizerFast:
 
     # 3) Fallback candidates (prefer project tokenizer, try language-specific then generic)
     candidates = [
-        Path(f"babybabellm-gptbert/tokenizers/tokenizer_{lang}.json"),
-        Path("babybabellm-gptbert/tokenizers/tokenizer.json"),
-        Path(f"gpt-bert/tokenizers/tokenizer_{lang}.json"),
-        Path("gpt-bert/tokenizers/tokenizer.json"),
+        PROJECT_ROOT / f"tokenizers/tokenizer_{lang}.json",
+        PROJECT_ROOT / "tokenizers/tokenizer.json",
+        Path(f"tokenizers/tokenizer_{lang}.json"),
+        Path("tokenizers/tokenizer.json"),
+        PROJECT_ROOT / "tokenizer.json",
         Path("tokenizer.json"),
     ]
     tok_file = None
@@ -138,54 +143,93 @@ def build_tokenizer(lang: str, args) -> PreTrainedTokenizerFast:
     return tokenizer
 
 
-def write_remote_code_files(target_dir: Path, causal: bool, force_causal_mask: bool):
+def write_remote_code_files(
+    target_dir: Path,
+    causal: bool,
+    force_causal_mask: bool,
+    emit_hidden_states: bool,
+    include_sequence_classification: bool,
+    classifier_dropout: float,
+    classifier_layer_norm_eps: float,
+    num_labels: int,
+):
     """Package the original training architecture for remote inference.
 
-    This embeds the exact model as trained (from gpt-bert/pretraining/model_extra.py)
+    This embeds the exact model as trained (from the BabyBabyLLM `pretraining/model_extra.py` file)
     to ensure state dict keys match and no layers are randomly reinitialized.
     If `causal` is True, default AutoModel maps to the CausalLM wrapper; otherwise to MaskedLM.
+    Optional helpers expose hidden states and add a sequence classification head compatible with
+    the original GLUE pipeline.
     """
-    config_txt = (
-        "from transformers import PretrainedConfig\n\n"
-        "class GPTBertConfig(PretrainedConfig):\n"
-        "    model_type = 'gpt_bert'\n"
-        "    def __init__(self, **kwargs):\n"
-        "        self.attention_probs_dropout_prob = kwargs.pop('attention_probs_dropout_prob', 0.1)\n"
-        "        self.hidden_dropout_prob = kwargs.pop('hidden_dropout_prob', 0.1)\n"
-        "        self.hidden_size = kwargs.pop('hidden_size', 768)\n"
-        "        self.intermediate_size = kwargs.pop('intermediate_size', 2560)\n"
-        "        self.max_position_embeddings = kwargs.pop('max_position_embeddings', 512)\n"
-        "        self.position_bucket_size = kwargs.pop('position_bucket_size', 32)\n"
-        "        self.num_attention_heads = kwargs.pop('num_attention_heads', 12)\n"
-        "        self.num_hidden_layers = kwargs.pop('num_hidden_layers', 12)\n"
-        "        self.vocab_size = kwargs.pop('vocab_size', 16384)\n"
-    "        self.layer_norm_eps = kwargs.pop('layer_norm_eps', 1e-5)\n"
-    "        self.force_causal_mask = kwargs.pop('force_causal_mask', False)\n"
-        f"        self.auto_map = {{\n"
-        f"            'AutoConfig': 'configuration_gpt_bert.GPTBertConfig',\n"
-        f"            'AutoModel': 'modeling_gpt_bert.{ 'GPTBertForCausalLM' if causal else 'GPTBertForMaskedLM' }',\n"
-        f"            'AutoModelForCausalLM': 'modeling_gpt_bert.GPTBertForCausalLM',\n"
-        f"            'AutoModelForMaskedLM': 'modeling_gpt_bert.GPTBertForMaskedLM',\n"
-        f"        }}\n"
-        "        super().__init__(**kwargs)\n"
+
+    auto_map_entries = [
+        "            'AutoConfig': 'configuration_gpt_bert.GPTBertConfig',",
+        f"            'AutoModel': 'modeling_gpt_bert.{ 'GPTBertForCausalLM' if causal else 'GPTBertForMaskedLM' }',",
+        "            'AutoModelForCausalLM': 'modeling_gpt_bert.GPTBertForCausalLM',",
+        "            'AutoModelForMaskedLM': 'modeling_gpt_bert.GPTBertForMaskedLM',",
+    ]
+    if include_sequence_classification:
+        auto_map_entries.append(
+            "            'AutoModelForSequenceClassification': 'modeling_gpt_bert.GPTBertForSequenceClassification',"
+        )
+    auto_map_body = "\n".join(auto_map_entries)
+
+    force_causal_mask_default = "True" if force_causal_mask else "False"
+    classifier_dropout_repr = repr(float(classifier_dropout))
+    classifier_layer_norm_eps_repr = repr(float(classifier_layer_norm_eps))
+    num_labels_repr = repr(int(num_labels))
+
+    config_txt = textwrap.dedent(
+        f"""
+        from transformers import PretrainedConfig
+
+        class GPTBertConfig(PretrainedConfig):
+            model_type = 'gpt_bert'
+
+            def __init__(self, **kwargs):
+                self.attention_probs_dropout_prob = kwargs.pop('attention_probs_dropout_prob', 0.1)
+                self.hidden_dropout_prob = kwargs.pop('hidden_dropout_prob', 0.1)
+                self.hidden_size = kwargs.pop('hidden_size', 768)
+                self.intermediate_size = kwargs.pop('intermediate_size', 2560)
+                self.max_position_embeddings = kwargs.pop('max_position_embeddings', 512)
+                self.position_bucket_size = kwargs.pop('position_bucket_size', 32)
+                self.num_attention_heads = kwargs.pop('num_attention_heads', 12)
+                self.num_hidden_layers = kwargs.pop('num_hidden_layers', 12)
+                self.vocab_size = kwargs.pop('vocab_size', 16384)
+                self.layer_norm_eps = kwargs.pop('layer_norm_eps', 1e-5)
+                self.force_causal_mask = kwargs.pop('force_causal_mask', {force_causal_mask_default})
+                self.classifier_dropout = kwargs.pop('classifier_dropout', {classifier_dropout_repr})
+                self.classifier_layer_norm_eps = kwargs.pop('classifier_layer_norm_eps', {classifier_layer_norm_eps_repr})
+                self.num_labels = kwargs.pop('num_labels', {num_labels_repr})
+                self.problem_type = kwargs.pop('problem_type', None)
+                self.auto_map = {{
+{auto_map_body}
+                }}
+                super().__init__(**kwargs)
+        """
     )
     (target_dir / "configuration_gpt_bert.py").write_text(config_txt, encoding="utf-8")
 
-    orig_path = Path("gpt-bert/pretraining/model_extra.py")
+    orig_path = PROJECT_ROOT / "pretraining" / "model_extra.py"
     try:
         orig_code = orig_path.read_text(encoding="utf-8")
     except Exception as e:
         raise RuntimeError(f"Failed to read original model code at {orig_path}: {e}")
 
+    import_block = "from transformers.modeling_outputs import MaskedLMOutput, CausalLMOutputWithCrossAttentions"
+    if include_sequence_classification:
+        import_block += ", SequenceClassifierOutput"
+
     wrapper_template = textwrap.dedent(
         """
         from transformers import PreTrainedModel
-        from transformers.modeling_outputs import MaskedLMOutput, CausalLMOutputWithCrossAttentions
+        __MODEL_OUTPUT_IMPORTS__
         from .configuration_gpt_bert import GPTBertConfig
         import torch
         import torch.nn as nn
 
         DEFAULT_FORCE_CAUSAL_MASK = __FORCE_CAUSAL_MASK__
+        EMIT_HIDDEN_STATES_DEFAULT = __EMIT_HIDDEN_STATES__
 
 
         def _normalize_mask_tensor(mask):
@@ -282,7 +326,10 @@ def write_remote_code_files(target_dir: Path, causal: bool, force_causal_mask: b
                     pass
                 return super().tie_weights()
 
-            def forward(self, input_ids, attention_mask=None, labels=None):
+            def forward(self, input_ids, attention_mask=None, labels=None, output_hidden_states=None, return_dict=None):
+                output_hidden_states = output_hidden_states if output_hidden_states is not None else (self.config.output_hidden_states or EMIT_HIDDEN_STATES_DEFAULT)
+                return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
                 mask_4d = _build_babylm_attention_mask(input_ids, attention_mask, force_causal=self.force_causal_mask)
                 static_embeddings, relative_embedding = self.model.embedding(input_ids)
                 if static_embeddings.dim() == 3 and static_embeddings.shape[0] == input_ids.shape[0]:
@@ -294,11 +341,21 @@ def write_remote_code_files(target_dir: Path, causal: bool, force_causal_mask: b
                 logits_flat = self.model.classifier.nonlinearity(flat)
                 vocab = logits_flat.size(-1)
                 logits = logits_flat.view(B, S, vocab)
+
                 loss = None
                 if labels is not None:
                     loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
                     loss = loss_fct(logits.view(-1, vocab), labels.view(-1))
-                return MaskedLMOutput(loss=loss, logits=logits)
+
+                hidden_states = (hs,) if output_hidden_states else None
+
+                if not return_dict:
+                    outputs = (logits,)
+                    if hidden_states is not None:
+                        outputs = outputs + (hidden_states,)
+                    return ((loss,) + outputs) if loss is not None else outputs
+
+                return MaskedLMOutput(loss=loss, logits=logits, hidden_states=hidden_states)
 
 
         class GPTBertForCausalLM(PreTrainedModel):
@@ -313,7 +370,10 @@ def write_remote_code_files(target_dir: Path, causal: bool, force_causal_mask: b
             def prepare_inputs_for_generation(self, input_ids, **kwargs):
                 return {'input_ids': input_ids, 'attention_mask': kwargs.get('attention_mask', None)}
 
-            def forward(self, input_ids, attention_mask=None, labels=None):
+            def forward(self, input_ids, attention_mask=None, labels=None, output_hidden_states=None, return_dict=None):
+                output_hidden_states = output_hidden_states if output_hidden_states is not None else (self.config.output_hidden_states or EMIT_HIDDEN_STATES_DEFAULT)
+                return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
                 mask_4d = _build_babylm_attention_mask(input_ids, attention_mask, force_causal=self.force_causal_mask)
                 static_embeddings, relative_embedding = self.model.embedding(input_ids)
                 if static_embeddings.dim() == 3 and static_embeddings.shape[0] == input_ids.shape[0]:
@@ -325,17 +385,114 @@ def write_remote_code_files(target_dir: Path, causal: bool, force_causal_mask: b
                 logits_flat = self.model.classifier.nonlinearity(flat)
                 vocab = logits_flat.size(-1)
                 logits = logits_flat.view(B, S, vocab)
+
                 loss = None
                 if labels is not None:
                     shift_logits = logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
                     loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
                     loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-                return CausalLMOutputWithCrossAttentions(loss=loss, logits=logits)
+
+                hidden_states = (hs,) if output_hidden_states else None
+
+                if not return_dict:
+                    outputs = (logits,)
+                    if hidden_states is not None:
+                        outputs = outputs + (hidden_states,)
+                    return ((loss,) + outputs) if loss is not None else outputs
+
+                return CausalLMOutputWithCrossAttentions(loss=loss, logits=logits, hidden_states=hidden_states)
+
+
+__SEQUENCE_CLASS_BLOCK__
         """
     )
 
-    wrapper_code = wrapper_template.replace("__FORCE_CAUSAL_MASK__", "True" if force_causal_mask else "False")
+    sequence_block = ""
+    if include_sequence_classification:
+        sequence_block = textwrap.dedent(
+            """
+            class ClassifierHead(nn.Module):
+                def __init__(self, config):
+                    super().__init__()
+                    self.nonlinearity = nn.Sequential(
+                        nn.LayerNorm(config.hidden_size, config.classifier_layer_norm_eps, elementwise_affine=False),
+                        nn.Linear(config.hidden_size, config.hidden_size),
+                        nn.GELU(),
+                        nn.LayerNorm(config.hidden_size, config.classifier_layer_norm_eps, elementwise_affine=False),
+                        nn.Dropout(config.classifier_dropout),
+                        nn.Linear(config.hidden_size, config.num_labels)
+                    )
+
+                def forward(self, embeddings):
+                    return self.nonlinearity(embeddings)
+
+
+            class GPTBertForSequenceClassification(PreTrainedModel):
+                config_class = GPTBertConfig
+                base_model_prefix = 'gpt_bert'
+
+                def __init__(self, config: GPTBertConfig):
+                    super().__init__(config)
+                    self.model = Bert(config)
+                    self.force_causal_mask = getattr(config, "force_causal_mask", DEFAULT_FORCE_CAUSAL_MASK)
+                    self.sequence_classifier = ClassifierHead(config)
+
+                def forward(self, input_ids, attention_mask=None, labels=None, output_hidden_states=None, return_dict=None):
+                    output_hidden_states = output_hidden_states if output_hidden_states is not None else (self.config.output_hidden_states or EMIT_HIDDEN_STATES_DEFAULT)
+                    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+                    mask_4d = _build_babylm_attention_mask(input_ids, attention_mask, force_causal=self.force_causal_mask)
+                    static_embeddings, relative_embedding = self.model.embedding(input_ids)
+                    if static_embeddings.dim() == 3 and static_embeddings.shape[0] == input_ids.shape[0]:
+                        static_embeddings = static_embeddings.transpose(0, 1)
+                    contextualized = self.model.transformer(static_embeddings, mask_4d, relative_embedding)
+                    hs = contextualized.transpose(0, 1)
+                    pooled_output = hs[:, 0, :]
+                    logits = self.sequence_classifier(pooled_output)
+
+                    loss = None
+                    if labels is not None:
+                        labels = labels.to(logits.device)
+                        problem_type = self.config.problem_type
+                        if problem_type is None:
+                            if self.config.num_labels == 1:
+                                problem_type = "regression"
+                            elif labels.dtype in (torch.long, torch.int):
+                                problem_type = "single_label_classification"
+                            else:
+                                problem_type = "multilabel_classification"
+
+                        if problem_type == "regression":
+                            logits = logits.squeeze(-1)
+                            loss_fct = nn.MSELoss()
+                            loss = loss_fct(logits, labels.float())
+                        elif problem_type == "single_label_classification":
+                            loss_fct = nn.CrossEntropyLoss()
+                            loss = loss_fct(logits.view(-1, self.config.num_labels), labels.view(-1))
+                        else:
+                            loss_fct = nn.BCEWithLogitsLoss()
+                            loss = loss_fct(logits, labels.float())
+
+                    hidden_states = (hs,) if output_hidden_states else None
+
+                    if not return_dict:
+                        outputs = (logits,)
+                        if hidden_states is not None:
+                            outputs = outputs + (hidden_states,)
+                        return ((loss,) + outputs) if loss is not None else outputs
+
+                    return SequenceClassifierOutput(loss=loss, logits=logits, hidden_states=hidden_states)
+            """
+        )
+
+    wrapper_code = (
+        wrapper_template
+        .replace("__FORCE_CAUSAL_MASK__", "True" if force_causal_mask else "False")
+        .replace("__EMIT_HIDDEN_STATES__", "True" if emit_hidden_states else "False")
+        .replace("__MODEL_OUTPUT_IMPORTS__", import_block)
+        .replace("__SEQUENCE_CLASS_BLOCK__", sequence_block)
+    )
 
     full_modeling = (
         "# Original training architecture (verbatim)\n" + orig_code + "\n\n# HF wrappers that preserve state dict keys and behavior\n" + wrapper_code
@@ -343,7 +500,15 @@ def write_remote_code_files(target_dir: Path, causal: bool, force_causal_mask: b
     (target_dir / "modeling_gpt_bert.py").write_text(full_modeling, encoding="utf-8")
 
 
-def _patch_rehost_config(config_path: Path, prefer_causal: bool, force_causal_mask: bool):
+def _patch_rehost_config(
+    config_path: Path,
+    prefer_causal: bool,
+    force_causal_mask: bool,
+    include_sequence_classification: bool,
+    classifier_dropout: float,
+    classifier_layer_norm_eps: float,
+    num_labels: int,
+):
     """Patch an existing config.json for rehosting.
 
     - Keep original model_type as-is.
@@ -365,27 +530,27 @@ def _patch_rehost_config(config_path: Path, prefer_causal: bool, force_causal_ma
     for n in needed:
         if n not in arch:
             arch.append(n)
-    # Reorder if prefer_causal
+    if include_sequence_classification and "GPTBertForSequenceClassification" not in arch:
+        arch.append("GPTBertForSequenceClassification")
+    # Reorder if prefer_causal (keep other entries afterward)
     if prefer_causal:
         arch = [a for a in needed if a in arch] + [a for a in arch if a not in needed]
     data["architectures"] = arch
     # auto_map
-    if prefer_causal:
-        data["auto_map"] = {
-            "AutoConfig": "configuration_gpt_bert.GPTBertConfig",
-            "AutoModel": "modeling_gpt_bert.GPTBertForCausalLM",
-            "AutoModelForCausalLM": "modeling_gpt_bert.GPTBertForCausalLM",
-            "AutoModelForMaskedLM": "modeling_gpt_bert.GPTBertForMaskedLM",
-        }
-    else:
-        data["auto_map"] = {
-            "AutoConfig": "configuration_gpt_bert.GPTBertConfig",
-            "AutoModel": "modeling_gpt_bert.GPTBertForMaskedLM",
-            "AutoModelForCausalLM": "modeling_gpt_bert.GPTBertForCausalLM",
-            "AutoModelForMaskedLM": "modeling_gpt_bert.GPTBertForMaskedLM",
-        }
+    auto_map = {
+        "AutoConfig": "configuration_gpt_bert.GPTBertConfig",
+        "AutoModel": "modeling_gpt_bert.GPTBertForCausalLM" if prefer_causal else "modeling_gpt_bert.GPTBertForMaskedLM",
+        "AutoModelForCausalLM": "modeling_gpt_bert.GPTBertForCausalLM",
+        "AutoModelForMaskedLM": "modeling_gpt_bert.GPTBertForMaskedLM",
+    }
+    if include_sequence_classification:
+        auto_map["AutoModelForSequenceClassification"] = "modeling_gpt_bert.GPTBertForSequenceClassification"
+    data["auto_map"] = auto_map
     if force_causal_mask:
         data["force_causal_mask"] = True
+    data["classifier_dropout"] = float(classifier_dropout)
+    data["classifier_layer_norm_eps"] = float(classifier_layer_norm_eps)
+    data["num_labels"] = int(num_labels)
     config_path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -502,13 +667,16 @@ def rehost_repos(args):
             except Exception as e:
                 print(f"[rehost] Failed snapshot {src}: {e}")
                 continue
-            # Ensure remote code present
-            write_remote_code_files(local_src, causal=True, force_causal_mask=args.force_causal_mask)  # prefer causal mapping globally for rehost
-            # Patch config
             cfg_path = local_src / "config.json"
-            if not cfg_path.exists():
-                # create minimal config if absent
-                minimal = {
+            config_payload: Dict[str, Any] = {}
+            if cfg_path.exists():
+                try:
+                    config_payload = json.loads(cfg_path.read_text(encoding="utf-8"))
+                except Exception as e:
+                    print(f"[rehost] Failed to read config for {src} ({e}); using defaults")
+                    config_payload = {}
+            if not config_payload:
+                config_payload = {
                     "model_type": "gpt_bert",
                     "hidden_size": 768,
                     "num_hidden_layers": 12,
@@ -516,8 +684,44 @@ def rehost_repos(args):
                     "intermediate_size": 2560,
                     "vocab_size": 16384,
                 }
-                cfg_path.write_text(json.dumps(minimal, indent=2), encoding="utf-8")
-            _patch_rehost_config(cfg_path, prefer_causal=True, force_causal_mask=args.force_causal_mask)
+
+            classifier_dropout = args.sequence_dropout if args.sequence_dropout is not None else config_payload.get("classifier_dropout", 0.1)
+            classifier_layer_norm_eps = args.sequence_layer_norm_eps if args.sequence_layer_norm_eps is not None else config_payload.get("classifier_layer_norm_eps", 1e-5)
+            num_labels = args.sequence_num_labels if args.sequence_num_labels is not None else config_payload.get("num_labels", 2)
+            classifier_dropout = float(classifier_dropout)
+            classifier_layer_norm_eps = float(classifier_layer_norm_eps)
+            num_labels = int(num_labels)
+            include_sequence = bool(args.sequence_classification)
+            emit_hidden_states = bool(args.emit_hidden_states)
+
+            config_payload["classifier_dropout"] = classifier_dropout
+            config_payload["classifier_layer_norm_eps"] = classifier_layer_norm_eps
+            config_payload["num_labels"] = num_labels
+            config_payload["output_hidden_states"] = bool(emit_hidden_states)
+            cfg_path.write_text(json.dumps(config_payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+            # Ensure remote code present (prefer causal mapping globally for rehost)
+            write_remote_code_files(
+                local_src,
+                causal=True,
+                force_causal_mask=args.force_causal_mask,
+                emit_hidden_states=emit_hidden_states,
+                include_sequence_classification=include_sequence,
+                classifier_dropout=classifier_dropout,
+                classifier_layer_norm_eps=classifier_layer_norm_eps,
+                num_labels=num_labels,
+            )
+
+            # Patch config
+            _patch_rehost_config(
+                cfg_path,
+                prefer_causal=True,
+                force_causal_mask=args.force_causal_mask,
+                include_sequence_classification=include_sequence,
+                classifier_dropout=classifier_dropout,
+                classifier_layer_norm_eps=classifier_layer_norm_eps,
+                num_labels=num_labels,
+            )
             # README
             _write_rehost_readme(local_src, src, dst_repo, prefer_causal=True, force_causal_mask=args.force_causal_mask)
             if args.push:
@@ -561,6 +765,7 @@ def write_model_card(
     raw_files: List[str],
     causal: bool,
     force_causal_mask: bool,
+    sequence_classification: bool,
 ):
     files_listing = []
     if (out_dir / "model.safetensors").exists():
@@ -578,6 +783,9 @@ def write_model_card(
 
     causal_section = "" if not causal else f"""\n### Causal LM Wrapper\nThis repo includes a lightweight GPTBertForCausalLM wrapper.\nGeneration example:\n```python\nfrom transformers import AutoTokenizer, AutoModelForCausalLM\nmid='{repo_id}'\ntok=AutoTokenizer.from_pretrained(mid)\nmodel=AutoModelForCausalLM.from_pretrained(mid, trust_remote_code=True)\nprint(tok.decode(model.generate(**tok('Hello', return_tensors='pt'), max_new_tokens=20)[0], skip_special_tokens=True))\n```\n"""
     mask_section = "" if not force_causal_mask else """\n### Forced Causal Attention\nCausal attention is enforced during inference by applying a triangular future mask inside the remote code.\nThis prevents the hybrid GPT-BERT layers from attending to future tokens even when a bidirectional mask is provided.\n"""
+    seq_section = ""
+    if sequence_classification:
+        seq_section = f"""\n### Sequence Classification\n`GPTBertForSequenceClassification` mirrors the original GLUE classifier head for downstream fine-tuning.\n```python\nfrom transformers import AutoTokenizer, AutoModelForSequenceClassification\nmodel_id = '{repo_id}'\ntok = AutoTokenizer.from_pretrained(model_id)\nmodel = AutoModelForSequenceClassification.from_pretrained(model_id, trust_remote_code=True)\noutputs = model(**tok('This movie was great!', return_tensors='pt'))\nprint(outputs.logits)\n```\n"""
     # Minimal YAML frontmatter for Hub metadata validation
     header = "\n".join([
         "---",
@@ -588,7 +796,7 @@ def write_model_card(
         "---",
         "",
     ])
-    card = header + f"""# {repo_id}\n\nGPT-BERT style BabyBabyLLM model for language **{lang}**.\n\nThis repository may include both *main* and *EMA* variants.\n\n**Default variant exposed to generic loaders:** `{default_variant}`\n\n## Variants Available\n{', '.join(sorted(available_variants))}\n\n## Files\n{files_section}\n\n## Configuration\n```json\n{json.dumps(config_dict, indent=2)}\n```\nTokenizer file: `{Path(getattr(tokenizer, '_tokenizer_file', 'unknown')).name}`\n\n## Quick Usage\n```python\nfrom transformers import AutoTokenizer, AutoModelForMaskedLM\nmodel_id = '{repo_id}'\ntok = AutoTokenizer.from_pretrained(model_id)\nmodel = AutoModelForMaskedLM.from_pretrained(model_id, trust_remote_code=True)\nout = model(**tok('Hello world', return_tensors='pt'))\n```\n{causal_section}{mask_section}\n## Notes\n- Converted on {datetime.now(timezone.utc).isoformat()}\n- Weights are the exact trained parameters; no new layers were initialized.\n- Requires `trust_remote_code=True` due to custom architecture.\n"""
+    card = header + f"""# {repo_id}\n\nGPT-BERT style BabyBabyLLM model for language **{lang}**.\n\nThis repository may include both *main* and *EMA* variants.\n\n**Default variant exposed to generic loaders:** `{default_variant}`\n\n## Variants Available\n{', '.join(sorted(available_variants))}\n\n## Files\n{files_section}\n\n## Configuration\n```json\n{json.dumps(config_dict, indent=2)}\n```\nTokenizer file: `{Path(getattr(tokenizer, '_tokenizer_file', 'unknown')).name}`\n\n## Quick Usage\n```python\nfrom transformers import AutoTokenizer, AutoModelForMaskedLM\nmodel_id = '{repo_id}'\ntok = AutoTokenizer.from_pretrained(model_id)\nmodel = AutoModelForMaskedLM.from_pretrained(model_id, trust_remote_code=True)\nout = model(**tok('Hello world', return_tensors='pt'))\n```\n{causal_section}{mask_section}{seq_section}\n## Notes\n- Converted on {datetime.now(timezone.utc).isoformat()}\n- Weights are the exact trained parameters; no new layers were initialized.\n- Requires `trust_remote_code=True` due to custom architecture.\n"""
     (out_dir / "README.md").write_text(card, encoding="utf-8")
 
 
@@ -654,6 +862,10 @@ def _write_primary_config(
     config_dict: Dict[str, Any],
     prefer_causal: bool = False,
     force_causal_mask: bool = False,
+    include_sequence_classification: bool = False,
+    classifier_dropout: float = 0.1,
+    classifier_layer_norm_eps: float = 1e-5,
+    num_labels: int = 2,
 ):
     """Write a canonical config.json for the repo (after variants are saved)."""
     cfg = dict(config_dict)
@@ -663,23 +875,23 @@ def _write_primary_config(
     for n in ["GPTBertForMaskedLM", "GPTBertForCausalLM"]:
         if n not in arch:
             arch.append(n)
+    if include_sequence_classification and "GPTBertForSequenceClassification" not in arch:
+        arch.append("GPTBertForSequenceClassification")
     cfg["architectures"] = arch
-    if prefer_causal:
-        cfg["auto_map"] = {
-            "AutoConfig": "configuration_gpt_bert.GPTBertConfig",
-            "AutoModel": "modeling_gpt_bert.GPTBertForCausalLM",
-            "AutoModelForCausalLM": "modeling_gpt_bert.GPTBertForCausalLM",
-            "AutoModelForMaskedLM": "modeling_gpt_bert.GPTBertForMaskedLM",
-        }
-    else:
-        cfg["auto_map"] = {
-            "AutoConfig": "configuration_gpt_bert.GPTBertConfig",
-            "AutoModel": "modeling_gpt_bert.GPTBertForMaskedLM",
-            "AutoModelForCausalLM": "modeling_gpt_bert.GPTBertForCausalLM",
-            "AutoModelForMaskedLM": "modeling_gpt_bert.GPTBertForMaskedLM",
-        }
+    auto_map = {
+        "AutoConfig": "configuration_gpt_bert.GPTBertConfig",
+        "AutoModel": f"modeling_gpt_bert.{ 'GPTBertForCausalLM' if prefer_causal else 'GPTBertForMaskedLM' }",
+        "AutoModelForCausalLM": "modeling_gpt_bert.GPTBertForCausalLM",
+        "AutoModelForMaskedLM": "modeling_gpt_bert.GPTBertForMaskedLM",
+    }
+    if include_sequence_classification:
+        auto_map["AutoModelForSequenceClassification"] = "modeling_gpt_bert.GPTBertForSequenceClassification"
+    cfg["auto_map"] = auto_map
     if force_causal_mask:
         cfg["force_causal_mask"] = True
+    cfg["classifier_dropout"] = float(classifier_dropout)
+    cfg["classifier_layer_norm_eps"] = float(classifier_layer_norm_eps)
+    cfg["num_labels"] = int(num_labels)
     # Populate token ids if tokenizer available
     try:
         from transformers import AutoTokenizer
@@ -735,6 +947,10 @@ def convert_language(
         print(f"[!] No checkpoints found for language {lang} matching variant selection")
         return
 
+    classifier_dropout = float(base_config.get("classifier_dropout", getattr(args, "_sequence_dropout_value", 0.1)))
+    classifier_layer_norm_eps = float(base_config.get("classifier_layer_norm_eps", getattr(args, "_sequence_layer_norm_eps_value", 1e-5)))
+    config_num_labels = int(base_config.get("num_labels", getattr(args, "_sequence_num_labels_value", 2)))
+
     if args.separate_ema:
         # Process each variant independently into its own repo if ema
         for tag, ckpt in variants_to_do:
@@ -750,7 +966,19 @@ def convert_language(
                 tokenizer = build_tokenizer(lang, args)
                 tokenizer.save_pretrained(out_dir)
                 (out_dir / "original_project_config.json").write_text(json.dumps(base_config, indent=2), encoding="utf-8")
-                write_remote_code_files(out_dir, args.causal, args.force_causal_mask)
+                current_dropout = float(config_dict.get("classifier_dropout", classifier_dropout))
+                current_ln_eps = float(config_dict.get("classifier_layer_norm_eps", classifier_layer_norm_eps))
+                current_num_labels = int(config_dict.get("num_labels", config_num_labels))
+                write_remote_code_files(
+                    out_dir,
+                    args.causal,
+                    args.force_causal_mask,
+                    args.emit_hidden_states,
+                    args.sequence_classification,
+                    current_dropout,
+                    current_ln_eps,
+                    current_num_labels,
+                )
                 raw_files = _copy_raw_checkpoints(out_dir, ckpt, args.include_raw)
                 # Pointer files (default only if matches)
                 if tag == args.default_variant:
@@ -761,9 +989,18 @@ def convert_language(
                     # create alias if default not present yet
                     if not (out_dir / "model.safetensors").exists():
                         shutil.copy2(out_dir / f"model_{tag}.safetensors", out_dir / "model.safetensors")
-                write_model_card(out_dir, repo_id, lang, config_dict, tokenizer, args.default_variant, [tag], raw_files, args.causal, args.force_causal_mask)
+                write_model_card(out_dir, repo_id, lang, config_dict, tokenizer, args.default_variant, [tag], raw_files, args.causal, args.force_causal_mask, args.sequence_classification)
                 # Ensure canonical config.json present (save_pretrained temp copy discarded)
-                _write_primary_config(out_dir, config_dict, prefer_causal=args.causal, force_causal_mask=args.force_causal_mask)
+                _write_primary_config(
+                    out_dir,
+                    config_dict,
+                    prefer_causal=args.causal,
+                    force_causal_mask=args.force_causal_mask,
+                    include_sequence_classification=args.sequence_classification,
+                    classifier_dropout=current_dropout,
+                    classifier_layer_norm_eps=current_ln_eps,
+                    num_labels=current_num_labels,
+                )
                 if args.push:
                     create_repo(repo_id, exist_ok=True, private=False)
                     upload_folder(folder_path=str(out_dir), repo_id=repo_id, commit_message=f"Add {tag} weights for {lang}")
@@ -784,7 +1021,6 @@ def convert_language(
         tokenizer = build_tokenizer(lang, args)
         tokenizer.save_pretrained(out_dir)
         (out_dir / "original_project_config.json").write_text(json.dumps(base_config, indent=2), encoding="utf-8")
-        write_remote_code_files(out_dir, args.causal, args.force_causal_mask)
         raw_files_accum: List[str] = []
         default_state_dict: Optional[Dict[str, torch.Tensor]] = None
         final_config: Optional[Dict[str, Any]] = None
@@ -813,8 +1049,30 @@ def convert_language(
             if src.exists():
                 shutil.copy2(src, out_dir / "model.safetensors")
         assert final_config is not None
-        write_model_card(out_dir, repo_id, lang, final_config, tokenizer, args.default_variant, available_variant_tags, raw_files_accum, args.causal, args.force_causal_mask)
-        _write_primary_config(out_dir, final_config, prefer_causal=args.causal, force_causal_mask=args.force_causal_mask)
+        config_dropout = float(final_config.get("classifier_dropout", classifier_dropout))
+        config_ln_eps = float(final_config.get("classifier_layer_norm_eps", classifier_layer_norm_eps))
+        config_labels = int(final_config.get("num_labels", config_num_labels))
+        write_remote_code_files(
+            out_dir,
+            args.causal,
+            args.force_causal_mask,
+            args.emit_hidden_states,
+            args.sequence_classification,
+            config_dropout,
+            config_ln_eps,
+            config_labels,
+        )
+        write_model_card(out_dir, repo_id, lang, final_config, tokenizer, args.default_variant, available_variant_tags, raw_files_accum, args.causal, args.force_causal_mask, args.sequence_classification)
+        _write_primary_config(
+            out_dir,
+            final_config,
+            prefer_causal=args.causal,
+            force_causal_mask=args.force_causal_mask,
+            include_sequence_classification=args.sequence_classification,
+            classifier_dropout=config_dropout,
+            classifier_layer_norm_eps=config_ln_eps,
+            num_labels=config_labels,
+        )
         if args.push:
             create_repo(repo_id, exist_ok=True, private=False)
             upload_folder(folder_path=str(out_dir), repo_id=repo_id, commit_message=f"Add {' & '.join(available_variant_tags)} weights for {lang}")
@@ -834,7 +1092,7 @@ def main():
     parser.add_argument("--separate-ema", action="store_true", help="Store EMA in a separate -ema repo id (only affects EMA variant).")
     parser.add_argument("--username", default=None, help="Hub username/org.")
     # New: Source checkpoint discovery controls
-    parser.add_argument("--checkpoint-dir", default=str(CHECKPOINT_DIR), help="Directory containing source checkpoints (default: babybabellm-gptbert/model_checkpoints)")
+    parser.add_argument("--checkpoint-dir", default=str(CHECKPOINT_DIR), help=f"Directory containing source checkpoints (default: {CHECKPOINT_DIR})")
     parser.add_argument("--checkpoint-glob", default=CHECKPOINT_GLOB, help="Glob pattern to list candidate checkpoint files inside --checkpoint-dir (default: mono_*_small_1_2*.bin)")
     parser.add_argument("--checkpoint-regex", default=CHECKPOINT_PATTERN.pattern, help="Regex with named groups 'lang' and optional 'ema' to parse filenames (default matches mono_*_small_1_2*.bin)")
     parser.add_argument("--languages", nargs="*", default=None, help="Restrict to these 3-letter language codes (auto-detect if omitted).")
@@ -845,6 +1103,11 @@ def main():
     parser.add_argument("--causal", action="store_true", help="Emit CausalLM wrapper and push to repo id with -causal suffix.")
     parser.add_argument("--force-causal-mask", action="store_true", help="Embed a triangular causal mask into the remote code so future tokens are always masked.")
     parser.add_argument("--rehost-prefix", default=None, help="Rehost existing Hub repos whose ids start with this prefix (e.g. suchirsalham/babybabellm-mono-). When set, skips local checkpoint conversion.")
+    parser.add_argument("--emit-hidden-states", action=argparse.BooleanOptionalAction, default=True, help="Expose final hidden states in HF outputs by default.")
+    parser.add_argument("--sequence-classification", action=argparse.BooleanOptionalAction, default=True, help="Bundle a GPTBertForSequenceClassification head for downstream fine-tuning.")
+    parser.add_argument("--sequence-num-labels", type=int, default=None, help="Default num_labels for sequence classification head (overrides config).")
+    parser.add_argument("--sequence-dropout", type=float, default=None, help="Dropout rate for the GLUE-style classifier head (overrides config).")
+    parser.add_argument("--sequence-layer-norm-eps", type=float, default=None, help="Layer norm epsilon for the classifier head (overrides config).")
     # New: Repo naming template
     parser.add_argument(
         "--repo-template",
@@ -892,8 +1155,8 @@ def main():
     else:
         # try common locations; fallback to a minimal config
         candidates = [
-            Path("babybabellm-gptbert/configs/small.json"),
-            Path("gpt-bert/configs/small.json"),
+            PROJECT_ROOT / "configs/small.json",
+            PROJECT_ROOT / "configs/base.json",
         ]
         cfg_path = next((p for p in candidates if p.exists()), None)
         if cfg_path is None:
@@ -913,6 +1176,18 @@ def main():
             base_config = json.loads(cfg_path.read_text(encoding="utf-8"))
     if args.force_causal_mask:
         base_config = {**base_config, "force_causal_mask": True}
+
+    classifier_dropout_value = args.sequence_dropout if args.sequence_dropout is not None else base_config.get("classifier_dropout", 0.1)
+    classifier_layer_norm_eps_value = args.sequence_layer_norm_eps if args.sequence_layer_norm_eps is not None else base_config.get("classifier_layer_norm_eps", 1e-5)
+    num_labels_value = args.sequence_num_labels if args.sequence_num_labels is not None else base_config.get("num_labels", 2)
+
+    base_config["classifier_dropout"] = float(classifier_dropout_value)
+    base_config["classifier_layer_norm_eps"] = float(classifier_layer_norm_eps_value)
+    base_config["num_labels"] = int(num_labels_value)
+
+    args._sequence_dropout_value = float(classifier_dropout_value)
+    args._sequence_layer_norm_eps_value = float(classifier_layer_norm_eps_value)
+    args._sequence_num_labels_value = int(num_labels_value)
     print("Base config:")
     print(json.dumps(base_config, indent=2))
 
