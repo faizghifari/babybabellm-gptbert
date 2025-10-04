@@ -77,6 +77,8 @@ You can pass overrides via `--export`, e.g., `NAME`, `MAX_STEPS`, `N_GPUS`.
 
 - Use `scripts/convert_and_push_mono_1_2.py` to package trained checkpoints for the Hugging Face Hub or local export.
 - The script autodetects mono checkpoints in `model_checkpoints/`, saves the original tokenizer + remote code, and can optionally push directly to the Hub (`--push`).
+- It no longer depends on the legacy `gpt-bert` repository; all remote code and tokenizer fallbacks are resolved relative to this repo, so you can invoke it from any working directory.
+- By default the exported remote code emits hidden states and bundles a GLUE-style sequence classification head; tweak this with `--no-emit-hidden-states`, `--no-sequence-classification`, or the classifier hyperparameter flags if you need a leaner package.
 - Provide a Hub username via `--username` or set `HF_USERNAME` in your environment before running the script.
 - For quick smoke tests you can run it locally: `python scripts/convert_and_push_mono_1_2.py --variant both --languages eng --include-raw`.
 - Add `--rehost-prefix <org/repo-prefix>` to standardize remote code on existing Hub repos without touching local checkpoints.
@@ -108,6 +110,9 @@ Key arguments:
 - `--force-causal-mask`: insert a triangular future mask in the remote code so the exported model never attends to future tokens (mirrors the debugger’s forced causal mode).
 - `--causal`: append a causal wrapper and suffix repos with `-causal` when used with the default template.
 - `--rehost-prefix`: rebuild remote code for existing Hub repos instead of converting local weights.
+- `--emit-hidden-states` / `--no-emit-hidden-states`: control whether hidden states are returned by default from the exported models.
+- `--sequence-classification` / `--no-sequence-classification`: include or drop the baked-in `GPTBertForSequenceClassification` wrapper for GLUE-style fine-tuning.
+- `--sequence-dropout`, `--sequence-layer-norm-eps`, `--sequence-num-labels`: override the classifier head’s dropout, layer norm epsilon, and label count when packaging models or rehosting.
 
 ## Troubleshooting
 
