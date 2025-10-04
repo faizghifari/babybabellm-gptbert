@@ -267,7 +267,7 @@ def setup_training(args, tokenizer):
 
     # Read distributed env from torchrun or SLURM (fallbacks provided)
     args.world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    args.rank = int(os.environ.get("SLURM_PROCID", os.environ.get("RANK", "0")))
+    args.rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", "0")))
     args.gpus_per_node = int(
         os.environ.get(
             "SLURM_GPUS_ON_NODE",
@@ -311,12 +311,8 @@ def setup_training(args, tokenizer):
     if args.rank == 0:
         print(f"Group initialized? {torch.distributed.is_initialized()}", flush=True)
 
-    args.local_rank = int(
-        os.environ.get(
-            "LOCAL_RANK",
-            str(args.rank - args.gpus_per_node * (args.rank // args.gpus_per_node)),
-        )
-    )
+    args.local_rank = int(os.environ.get("LOCAL_RANK", args.rank % torch.cuda.device_count()))
+
     torch.cuda.set_device(args.local_rank)
     args.device = torch.device("cuda", args.local_rank)
     print(f"RCCL started on device {args.device}", flush=True)
@@ -405,6 +401,8 @@ def prepare_model_and_optimizer(args):
         {"params": [p for _, p in no_decay_params], "weight_decay": 0.0},
     ]
 
+    print("Initializing optimizer...")
+
     if args.optimizer in ("adam", "adamw"):
         optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters,
@@ -420,6 +418,7 @@ def prepare_model_and_optimizer(args):
             eps=args.optimizer_eps,
         )
 
+    print("Initializing scheduler...")
     scheduler = cosine_schedule_with_warmup_cooldown(
         optimizer,
         int(args.max_steps * args.warmup_proportion),
@@ -428,6 +427,7 @@ def prepare_model_and_optimizer(args):
         0.1,
     )
 
+    print("Initializing DDP model...")
     model = DistributedDataParallel(
         model,
         device_ids=[args.local_rank],
@@ -443,6 +443,7 @@ def prepare_model_and_optimizer(args):
 
     global_step, epoch = 0, 0
     if args.checkpoint_filename is not None and os.path.exists(args.checkpoint_filename):
+        print("Loading checkpoint...")
         state_dict = torch.load(args.checkpoint_filename, map_location="cpu")
         model.load_state_dict(state_dict["model"])
         ema_model.load_state_dict(state_dict["ema_model"])
@@ -454,6 +455,8 @@ def prepare_model_and_optimizer(args):
             args.cumulative_tokens = state_dict["cumulative_tokens"]
         return model, ema_model, optimizer, scheduler, global_step, epoch
 
+    print("Model prep finished!")
+    
     return model, ema_model, optimizer, scheduler, global_step, epoch
 
 
@@ -859,13 +862,20 @@ if __name__ == "__main__":
     # Ensure tokenizer path is provided and exists (no auto-building here)
     args = _maybe_build_tokenizer(args)
     tokenizer = Tokenizer.from_file(args.tokenizer_path)
-
+    
     setup_training(args, tokenizer)
     model, ema_model, optimizer, scheduler, global_step, start_epoch = (
         prepare_model_and_optimizer(args)
     )
 
+    print("is_main_process:", is_main_process())
+    print("wandb_disabled:", args.wandb_disabled)
+    print("rank:", args.rank)
+    print("local_rank:", args.local_rank)
+
     train_dataloader, valid_dataloader = None, None
+
+    print("STARTING TRAINING")
 
     for epoch in count(start=start_epoch):
         train_dataloader, valid_dataloader = load_datasets(
