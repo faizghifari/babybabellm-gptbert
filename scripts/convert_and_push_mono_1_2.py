@@ -197,11 +197,6 @@ def write_remote_code_files(
                 self.num_hidden_layers = kwargs.pop('num_hidden_layers', 12)
                 self.vocab_size = kwargs.pop('vocab_size', 16384)
                 self.layer_norm_eps = kwargs.pop('layer_norm_eps', 1e-5)
-                self.force_causal_mask = kwargs.pop('force_causal_mask', {force_causal_mask_default})
-                self.classifier_dropout = kwargs.pop('classifier_dropout', {classifier_dropout_repr})
-                self.classifier_layer_norm_eps = kwargs.pop('classifier_layer_norm_eps', {classifier_layer_norm_eps_repr})
-                self.num_labels = kwargs.pop('num_labels', {num_labels_repr})
-                self.problem_type = kwargs.pop('problem_type', None)
                 self.auto_map = {{
 {auto_map_body}
                 }}
@@ -404,7 +399,7 @@ def write_remote_code_files(
                 return CausalLMOutputWithCrossAttentions(loss=loss, logits=logits, hidden_states=hidden_states)
 
 
-__SEQUENCE_CLASS_BLOCK__
+        __SEQUENCE_CLASS_BLOCK__
         """
     )
 
@@ -1202,6 +1197,7 @@ def main():
         print(f"[!] Invalid --checkpoint-regex: {e}")
         return
     all_ckpts = list(ckpt_dir.glob(args.checkpoint_glob))
+    print(args.checkpoint_glob, all_ckpts)
     lang_map: Dict[str, Dict[str, Path]] = {}
     for ck in all_ckpts:
         m = filename_regex.match(ck.name)
