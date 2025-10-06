@@ -136,7 +136,10 @@ if [[ $need_preprocess -eq 1 ]]; then
   if [[ ! -f "$TOK_FILE" ]]; then
     echo "Tokenizer not found at $TOK_FILE. Training tokenizer..."
     if [[ -n "${PREPROCESS_MONO_LANG:-}" ]]; then
-      python "$ROOT_DIR/tokenizers/tokenizer.py" --vocab_size "$VOCAB_SIZE" --output "tokenizer_${PREPROCESS_MONO_LANG}_vs${VOCAB_SIZE}.json"
+      python "$ROOT_DIR/tokenizers/tokenizer.py" \
+        --vocab_size "$VOCAB_SIZE" \
+        --output "tokenizer_${PREPROCESS_MONO_LANG}_vs${VOCAB_SIZE}.json" \
+        --languages "$PREPROCESS_MONO_LANG"
     else
       python "$ROOT_DIR/tokenizers/tokenizer.py" --vocab_size "$VOCAB_SIZE" --output "tokenizer_multilingual_vs${VOCAB_SIZE}.json"
     fi
