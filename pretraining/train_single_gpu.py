@@ -21,8 +21,8 @@ from lamb import Lamb
 from model_extra import Bert
 from utils import cosine_schedule_with_warmup_cooldown, is_main_process, seed_everything
 from dataset import MaskedDataset, CausalDataset, ValidationDataset
-#from model_logging import ModelLogger
-#import wandb
+from model_logging import ModelLogger
+import wandb
 
 
 def parse_arguments():
@@ -31,8 +31,8 @@ def parse_arguments():
     parser.add_argument("--train_path", default="../data/train_100M_tokenized.bin", type=str, help="Path to the training data.")
     parser.add_argument("--valid_path", default="../data/valid_100M_tokenized.bin", type=str, help="Path to the validation data.")
     parser.add_argument("--name", default="hybrid_100M", type=str, help="Name of the run.")
-    #parser.add_argument("--wandb_project", default="YOUR_WANDB_PROJECT_NAME", type=str, help="Name of the WandB project to log into.")
-    #parser.add_argument("--wandb_entity", default="YOUR_WANDB_ENTITY", type=str, help="The entity to log to on WandB (typically your wandb username).")
+    parser.add_argument("--wandb_project", default="YOUR_WANDB_PROJECT_NAME", type=str, help="Name of the WandB project to log into.")
+    parser.add_argument("--wandb_entity", default="YOUR_WANDB_ENTITY", type=str, help="The entity to log to on WandB (typically your wandb username).")
     parser.add_argument("--config_file", default="../configs/base.json", type=str, help="The BERT model config")
     parser.add_argument("--tokenizer_path", default="../tokenizers/tokenizer_100M.json", type=str, help="Path to the tokenizer.")
     parser.add_argument("--output_dir", default="../model_checkpoints", type=str, help="The output directory where the model checkpoints will be written.")
@@ -86,11 +86,9 @@ def setup_training(args, tokenizer):
 
     args.vocab_size = tokenizer.get_vocab_size()
 
-    #wandb.init(
-    #    name="babylm-interaction",
-    #    entity="babylm-interaction",
-    #    project="gptbert"
-    #)
+    wandb.init(
+       project=args.wandb_project, entity=args.wandb_entity, name=os.environ.get("WANDB_NAME", args.name), config=vars(args), mode=os.environ.get("WANDB_MODE","online")
+    )
 
 
 def load_config(args):
@@ -106,9 +104,9 @@ def prepare_model_and_optimizer(args):
     model = Bert(args)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    #wandb.config.update(args)
-    #wandb.config.update({"n_params": n_params})
-    print(model)
+    wandb.config.update(args)
+    wandb.config.update({"n_params": n_params})
+    # print(model)
     print(f"NUMBER OF PARAMETERS: {n_params}\n", flush=True)
 
     model.to(args.device)
@@ -121,13 +119,13 @@ def prepare_model_and_optimizer(args):
         {'params': [p for _, p in no_decay_params], 'weight_decay': 0.0}
     ]
 
-    print("Parameters without weight decay:")
-    for n, _ in no_decay_params:
-        print(n)
-    print()
-    print("Parameters with weight decay:")
-    for n, _ in decay_params:
-        print(n)
+    # print("Parameters without weight decay:")
+    # for n, _ in no_decay_params:
+    #     print(n)
+    # print()
+    # print("Parameters with weight decay:")
+    # for n, _ in decay_params:
+    #     print(n)
     print(flush=True)
 
     if args.optimizer == "adam" or args.optimizer == "adamw":
@@ -182,6 +180,13 @@ def get_batch(dataloader, device, global_step):
 
 def save(model, ema_model, optimizer, scheduler, global_step, masked_epoch, causal_epoch, args):
     if is_main_process():
+        # Ensure output directory exists
+        out_dir = os.path.dirname(args.output_path)
+        if out_dir and not os.path.isdir(out_dir):
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+            except Exception as e:
+                print(f"[warn] Could not create output directory {out_dir}: {e}")
         model_to_save = model.module if hasattr(model, 'module') else model  # Only save the model itself
         torch.save(model_to_save.state_dict(), args.output_path)
         torch.save(ema_model.state_dict(), args.output_path.replace(".bin", "_ema.bin"))
@@ -410,28 +415,28 @@ def training_epoch(model, ema_model, train_dataloader, valid_dataloader, optimiz
                 causal_epoch = epoch
 
         # log the metrics
-        #wandb.log(
-        #    {
-        #        "masked_epoch": masked_epoch,
-        #        "causal_epoch": causal_epoch,
-        #        "train/loss": total_loss.item(),
-        #        "train/z_loss": total_z_loss.item(),
-        #        "train/perplexity": math.exp(total_loss.item()),
-        #        "train/accuracy": total_accuracy.item() * 100.0,
-        #        "train/masked_accuracy": masked_accuracy * 100.0,
-        #        "train/causal_accuracy": causal_accuracy * 100.0,
-        #        "train/mlm_loss": masked_loss,
-        #        "train/clm_loss": causal_loss,
-        #        "stats/learning_rate": optimizer.param_groups[0]['lr'],
-        #        "stats/grad_norm": total_grad_norm,
-        #        "stats/seq_length": train_dataloader.dataset.seq_length,
-        #        "stats/global_batch_size": args.current_global_batch_size,
-        #        "stats/local_batch_size": args.current_local_batch_size,
-        #        "stats/accumulate_steps": args.accumulate_steps,
-        #        "stats/mask_p": mask_p.item(),
-        #    },
-        #    commit=False
-        #)
+        wandb.log(
+           {
+               "masked_epoch": masked_epoch,
+               "causal_epoch": causal_epoch,
+               "train/loss": total_loss.item(),
+               "train/z_loss": total_z_loss.item(),
+               "train/perplexity": math.exp(total_loss.item()),
+               "train/accuracy": total_accuracy.item() * 100.0,
+               "train/masked_accuracy": masked_accuracy * 100.0,
+               "train/causal_accuracy": causal_accuracy * 100.0,
+               "train/mlm_loss": masked_loss,
+               "train/clm_loss": causal_loss,
+               "stats/learning_rate": optimizer.param_groups[0]['lr'],
+               "stats/grad_norm": total_grad_norm,
+               "stats/seq_length": train_dataloader.dataset.seq_length,
+               "stats/global_batch_size": args.current_global_batch_size,
+            #    "stats/local_batch_size": args.current_local_batch_size,
+            #    "stats/accumulate_steps": args.accumulate_steps,
+               "stats/mask_p": mask_p.item(),
+           },
+           commit=False
+        )
 
         # zero the accumulated gradients and the metrics
         optimizer.zero_grad(set_to_none=True)
@@ -441,8 +446,8 @@ def training_epoch(model, ema_model, train_dataloader, valid_dataloader, optimiz
         if global_step % args.save_every == 0:
             save(model, ema_model, optimizer, scheduler, global_step, masked_epoch, causal_epoch, args)
         # log the stats and commit
-        #if is_main_process():
-        #    wandb.log({"global_step": global_step}, commit=True)
+        if is_main_process():
+           wandb.log({"global_step": global_step}, commit=True)
 
         global_step += 1
 
@@ -549,29 +554,29 @@ def training(model, ema_model, masked_train_dataloader, causal_train_dataloader,
                 param_k.data.mul_(args.ema_decay).add_((1.0 - args.ema_decay) * param_q.detach().data)
 
         # log the metrics
-        #if is_main_process():
-        #    wandb.log(
-        #        {
-        #            "masked_epoch": masked_epoch,
-        #            "causal_epoch": causal_epoch,
-        #            "train/loss": total_loss.item(),
-        #            "train/masked_loss": total_masked_loss.item(),
-        #            "train/causal_loss": total_causal_loss.item(),
-        #            "train/z_loss": total_z_loss.item(),
-        #            "train/perplexity": math.exp(total_loss.item()),
-        #            "train/accuracy": total_accuracy.item() * 100.0,
-        #            "train/masked_accuracy": total_masked_accuracy.item() * 100.0,
-        #            "train/causal_accuracy": total_causal_accuracy.item() * 100.0,
-        #            "stats/learning_rate": optimizer.param_groups[0]['lr'],
-        #            "stats/grad_norm": total_grad_norm,
-        #            "stats/seq_length": masked_train_dataloader.dataset.seq_length,
-        #            "stats/global_batch_size": args.current_global_batch_size,
-        #            "stats/local_batch_size": args.current_local_batch_size,
-        #            "stats/accumulate_steps": args.accumulate_steps,
-        #            "stats/mask_p": mask_p.item(),
-        #        },
-        #        commit=False
-        #    )
+        if is_main_process():
+           wandb.log(
+               {
+                   "masked_epoch": masked_epoch,
+                   "causal_epoch": causal_epoch,
+                   "train/loss": total_loss.item(),
+                   "train/masked_loss": total_masked_loss.item(),
+                   "train/causal_loss": total_causal_loss.item(),
+                   "train/z_loss": total_z_loss.item(),
+                   "train/perplexity": math.exp(total_loss.item()),
+                   "train/accuracy": total_accuracy.item() * 100.0,
+                   "train/masked_accuracy": total_masked_accuracy.item() * 100.0,
+                   "train/causal_accuracy": total_causal_accuracy.item() * 100.0,
+                   "stats/learning_rate": optimizer.param_groups[0]['lr'],
+                   "stats/grad_norm": total_grad_norm,
+                   "stats/seq_length": masked_train_dataloader.dataset.seq_length,
+                   "stats/global_batch_size": args.current_global_batch_size,
+                #    "stats/local_batch_size": args.current_local_batch_size,
+                #    "stats/accumulate_steps": args.accumulate_steps,
+                   "stats/mask_p": mask_p.item(),
+               },
+               commit=False
+           )
 
         # zero the accumulated gradients and the metrics
         optimizer.zero_grad(set_to_none=True)
@@ -584,8 +589,8 @@ def training(model, ema_model, masked_train_dataloader, causal_train_dataloader,
             save(model, ema_model, optimizer, scheduler, global_step, masked_epoch, causal_epoch, args)
 
         # log the stats and commit
-        #if is_main_process():
-        #    wandb.log({"global_step": global_step}, commit=True)
+        if is_main_process():
+           wandb.log({"global_step": global_step}, commit=True)
 
         global_step += 1
         train_progress_bar.update()
